@@ -3,12 +3,12 @@ Relay Phase 0 — E2E Tests
 Tests the full Python→Rust→Python round-trip.
 """
 
-import _relay
+import relay._relay as _relay
 
 
 def test_version():
     """Relay version matches Cargo.toml."""
-    assert _relay.version() == "0.1.0"
+    assert _relay.version() == "0.6.0"
 
 
 def test_create_i32_array():

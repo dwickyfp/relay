@@ -6,7 +6,7 @@ import gc
 import tempfile
 import tracemalloc
 
-import _relay
+import relay._relay as _relay
 import pyarrow as pa
 import pyarrow.ipc as ipc
 

@@ -370,7 +370,7 @@ fn widen(a: DataType, b: DataType) -> DataType {
 
 /// Find all record boundary positions (newlines outside quotes).
 /// Uses quote-parity monoid approach for correctness with quoted fields.
-pub(crate) fn find_record_boundaries(data: &[u8], quote: u8) -> Vec<usize> {
+pub fn find_record_boundaries(data: &[u8], quote: u8) -> Vec<usize> {
     let mut boundaries = Vec::new();
     let mut in_quotes = false;
 

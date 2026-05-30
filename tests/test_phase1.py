@@ -2,7 +2,7 @@
 Phase 1 E2E Tests: Relay ↔ PyArrow ↔ DuckDB ↔ Polars ↔ NumPy Interop
 """
 import pytest
-import _relay
+import relay._relay as _relay
 import pyarrow as pa
 import numpy as np
 import duckdb

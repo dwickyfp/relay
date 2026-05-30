@@ -9,7 +9,7 @@ import tracemalloc
 import time
 
 import pytest
-import _relay
+import relay._relay as _relay
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.parquet as pq

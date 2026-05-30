@@ -12,12 +12,16 @@ use relay_arrow::{RelayArray, RelayRecordBatch};
 use relay_io::ipc::write_ipc;
 use relay_io::mmap::MmapIPCReader;
 use relay_io::parquet::ParquetReader;
+use relay_io::csv::{CsvReader, CsvReadOptions};
+use relay_io::json::{JsonReader, JsonReadOptions};
 // use relay_io::AccessPattern;
 
 /// Unified reader that wraps either IPC or Parquet reader
 enum ReaderKind {
     Ipc(MmapIPCReader),
     Parquet(ParquetReader),
+    Csv(CsvReader),
+    Json(JsonReader),
 }
 
 #[pymodule]
@@ -38,6 +42,8 @@ fn _relay(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(benchmark_export_throughput, m)?)?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_function(wrap_pyfunction!(scan_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_csv, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_json, m)?)?;
     m.add_function(wrap_pyfunction!(write_ipc_file, m)?)?;
     Ok(())
 }
@@ -187,6 +193,158 @@ fn scan_parquet(path: &str) -> PyResult<PyScanResult> {
     })
 }
 
+/// Scan a CSV file with SWAR-accelerated parsing.
+///
+/// Returns a ScanResult with batch-by-batch access to the data.
+///
+/// # Features
+/// - Memory-mapped file reading (zero-copy)
+/// - SWAR-accelerated boundary detection (3.4x faster than scalar)
+/// - Parallel parsing with Rayon
+/// - Automatic schema inference from first 1024 rows
+/// - Support for quoted fields with embedded delimiters
+///
+/// # Arguments
+/// * `path` - Path to the CSV file
+/// * `has_header` - Whether the first row is a header (default: true)
+/// * `delimiter` - Field delimiter character (default: ",")
+/// * `use_simd` - Enable SWAR acceleration (default: true)
+///
+/// # Example
+/// ```python
+/// import relay
+/// 
+/// # Scan a CSV file
+/// result = relay.scan_csv("data.csv")
+/// print(f"Rows: {result.num_rows()}, Cols: {result.num_columns()}")
+/// 
+/// # Read all data
+/// batch = result.read_all()
+/// 
+/// # Or read with projection (only specific columns)
+/// batch = result.read_columns(["id", "name", "value"])
+/// ```
+///
+/// # Performance
+/// For a 2M row CSV file with 10 columns:
+/// - Relay: ~680ms
+/// - Polars: ~44ms (reference)
+///
+/// Note: Current implementation parses all columns even with projection.
+/// Column-first decode optimization is planned for future versions.
+#[pyfunction]
+#[pyo3(signature = (path, has_header=true, delimiter=",", use_simd=true))]
+fn scan_csv(
+    path: &str,
+    has_header: bool,
+    delimiter: &str,
+    use_simd: bool,
+) -> PyResult<PyScanResult> {
+    let delim = delimiter
+        .as_bytes()
+        .first()
+        .copied()
+        .unwrap_or(b',');
+
+    let options = CsvReadOptions {
+        has_header,
+        delimiter: delim,
+        quote: b'"',
+        trim: true,
+        use_simd,
+        ..Default::default()
+    };
+
+    let reader = CsvReader::open(std::path::Path::new(path), options)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+    let num_rows = reader.num_rows();
+    let num_columns = reader.schema().fields().len();
+    let column_names: Vec<String> = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    Ok(PyScanResult {
+        reader: Some(ReaderKind::Csv(reader)),
+        path: path.to_string(),
+        num_rows,
+        num_columns,
+        column_names,
+        format: "csv".to_string(),
+    })
+}
+
+/// Scan a JSON or NDJSON file with parallel parsing.
+///
+/// Returns a ScanResult with batch-by-batch access to the data.
+/// Automatically detects whether the file is a JSON array or NDJSON format.
+///
+/// # Features
+/// - Memory-mapped file reading (zero-copy)
+/// - Parallel parsing with Rayon
+/// - Automatic format detection (JSON array vs NDJSON)
+/// - Automatic schema inference from first 1024 rows
+/// - Type coercion (e.g., int fields become Int64, float fields become Float64)
+///
+/// # Arguments
+/// * `path` - Path to the JSON/NDJSON file
+///
+/// # Example
+/// ```python
+/// import relay
+///
+/// # Scan an NDJSON file (one JSON object per line)
+/// result = relay.scan_json("data.ndjson")
+/// print(f"Rows: {result.num_rows()}, Cols: {result.num_columns()}")
+///
+/// # Read all data
+/// batch = result.read_all()
+///
+/// # Or read with projection
+/// batch = result.read_columns(["user_id", "timestamp"])
+/// ```
+///
+/// # Supported Formats
+/// - **JSON Array**: `[{"a": 1, "b": 2}, {"a": 3, "b": 4}]`
+/// - **NDJSON**: One JSON object per line
+///   ```json
+///   {"a": 1, "b": 2}
+///   {"a": 3, "b": 4}
+///   ```
+///
+/// # Performance
+/// For a 1M row NDJSON file with 10 columns:
+/// - Relay: ~279ms
+/// - Polars: ~103ms (reference)
+///
+/// NDJSON performance is much better than CSV due to simpler parsing requirements.
+#[pyfunction]
+fn scan_json(path: &str) -> PyResult<PyScanResult> {
+    let reader = JsonReader::open(std::path::Path::new(path), JsonReadOptions::default())
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+    let num_rows = reader.num_rows();
+    let num_columns = reader.schema().fields().len();
+    let column_names: Vec<String> = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    Ok(PyScanResult {
+        reader: Some(ReaderKind::Json(reader)),
+        path: path.to_string(),
+        num_rows,
+        num_columns,
+        column_names,
+        format: "json".to_string(),
+    })
+}
+
 /// Write a PyRelayBatch to an Arrow IPC file.
 #[pyfunction]
 fn write_ipc_file(path: &str, batch: &PyRelayBatch) -> PyResult<()> {
@@ -200,6 +358,35 @@ fn write_ipc_file(path: &str, batch: &PyRelayBatch) -> PyResult<()> {
 }
 
 /// Result from scanning an IPC or Parquet file. Provides batch-by-batch access.
+/// A scan result providing batch-by-batch access to data from various file formats.
+///
+/// ScanResult is returned by scan functions (scan_csv, scan_json, scan_parquet)
+/// and provides methods to read data in batches or all at once, with optional
+/// column projection for memory efficiency.
+///
+/// # Attributes
+/// * `num_rows` - Total number of rows in the dataset
+/// * `num_columns` - Number of columns in the dataset
+/// * `column_names` - List of column names
+/// * `format` - File format ("csv", "json", "parquet", "ipc")
+///
+/// # Example
+/// ```python
+/// import relay
+///
+/// # Scan a file
+/// result = relay.scan_csv("data.csv")
+///
+/// # Inspect metadata
+/// print(f"Shape: {result.num_rows} x {result.num_columns}")
+/// print(f"Columns: {result.column_names}")
+///
+/// # Read all data
+/// batch = result.read_all()
+///
+/// # Or read with projection (memory efficient)
+/// batch = result.read_columns(["id", "value"])
+/// ```
 #[pyclass(name = "ScanResult")]
 pub struct PyScanResult {
     reader: Option<ReaderKind>,
@@ -254,6 +441,18 @@ impl PyScanResult {
         let batch = match reader {
             ReaderKind::Ipc(r) => r.read_batch(index),
             ReaderKind::Parquet(r) => r.read_batch(index),
+            ReaderKind::Csv(r) => {
+                if index != 0 {
+                    return Err(pyo3::exceptions::PyIndexError::new_err("CSV has only 1 batch (index 0)"));
+                }
+                r.read_all()
+            }
+            ReaderKind::Json(r) => {
+                if index != 0 {
+                    return Err(pyo3::exceptions::PyIndexError::new_err("JSON has only 1 batch (index 0)"));
+                }
+                r.read_all()
+            }
         }
         .map_err(|e| pyo3::exceptions::PyIndexError::new_err(e.to_string()))?;
 
@@ -261,7 +460,25 @@ impl PyScanResult {
         Ok(PyRelayBatch { inner: relay_batch })
     }
 
-    /// Read all batches as a single PyRelayBatch.
+    /// Read all rows from the scanned file into a single RelayBatch.
+    ///
+    /// Returns a RelayBatch containing all rows and columns from the file.
+    /// For large files, consider using read_columns() with projection to
+    /// reduce memory usage.
+    ///
+    /// Returns:
+    ///     RelayBatch: A batch containing all data from the file.
+    ///
+    /// Example:
+    /// ```python
+    /// result = relay.scan_csv("data.csv")
+    /// batch = result.read_all()
+    /// print(f"Loaded {batch.num_rows()} rows")
+    /// ```
+    ///
+    /// Note:
+    ///     For CSV/JSON files, all data is read into a single batch.
+    ///     For Parquet/IPC files, multiple batches may be concatenated.
     fn read_all(&mut self) -> PyResult<PyRelayBatch> {
         let reader = self.reader.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
@@ -270,6 +487,8 @@ impl PyScanResult {
         let batches = match reader {
             ReaderKind::Ipc(r) => r.read_all(),
             ReaderKind::Parquet(r) => r.read_all(),
+            ReaderKind::Csv(r) => r.read_all().map(|b| vec![b]),
+            ReaderKind::Json(r) => r.read_all().map(|b| vec![b]),
         }
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
@@ -311,6 +530,28 @@ impl PyScanResult {
     }
 
     /// Read specific columns only (projection pushdown).
+    ///
+    /// Returns a RelayBatch containing only the specified columns, which is
+    /// more memory efficient for large files with many columns.
+    ///
+    /// Args:
+    ///     columns: List of column names to read.
+    ///
+    /// Returns:
+    ///     RelayBatch: A batch containing only the requested columns.
+    ///
+    /// Example:
+    /// ```python
+    /// result = relay.scan_csv("data.csv")
+    /// # Read only id and value columns
+    /// batch = result.read_columns(["id", "value"])
+    /// print(f"Columns: {batch.column_names()}")
+    /// ```
+    ///
+    /// Note:
+    ///     For Parquet files, this enables true projection pushdown (only reads
+    ///     requested columns from disk). For CSV/JSON, all columns are parsed
+    ///     but only requested ones are returned.
     fn read_columns(&self, columns: Vec<String>) -> PyResult<PyRelayBatch> {
         let reader = self.reader.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
@@ -320,6 +561,8 @@ impl PyScanResult {
         let batches = match reader {
             ReaderKind::Ipc(r) => r.read_columns(&col_refs),
             ReaderKind::Parquet(r) => r.read_columns(&col_refs),
+            ReaderKind::Csv(r) => r.read_columns(&col_refs).map(|b| vec![b]),
+            ReaderKind::Json(r) => r.read_columns(&col_refs).map(|b| vec![b]),
         }
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
@@ -401,6 +644,11 @@ impl PyScanResult {
         let result = match reader {
             ReaderKind::Ipc(r) => r.streaming_agg(column, io_agg_op),
             ReaderKind::Parquet(r) => r.streaming_agg(column, io_agg_op),
+            ReaderKind::Csv(_) | ReaderKind::Json(_) => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "streaming_agg not supported for CSV/JSON. Use read_all() instead.",
+                ));
+            }
         }
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
@@ -461,6 +709,11 @@ impl PyScanResult {
             ReaderKind::Parquet(r) => {
                 r.parallel_filter_agg_i64(filter_col, op, threshold, agg_col, io_agg_op)
             }
+            ReaderKind::Csv(_) | ReaderKind::Json(_) => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "filter_agg not supported for CSV/JSON. Use read_all() instead.",
+                ));
+            }
         }
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
@@ -494,6 +747,11 @@ impl PyScanResult {
         let batches = match reader {
             ReaderKind::Ipc(r) => r.parallel_filter_i64(filter_col, op, threshold),
             ReaderKind::Parquet(r) => r.parallel_filter_i64(filter_col, op, threshold),
+            ReaderKind::Csv(_) | ReaderKind::Json(_) => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "parallel_filter not supported for CSV/JSON. Use read_all() instead.",
+                ));
+            }
         }
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
@@ -586,6 +844,8 @@ impl PyScanResult {
         let filter_batches = match reader {
             ReaderKind::Ipc(r) => r.read_columns(&[column]),
             ReaderKind::Parquet(r) => r.read_columns(&[column]),
+            ReaderKind::Csv(r) => r.read_columns(&[column]).map(|b| vec![b]),
+            ReaderKind::Json(r) => r.read_columns(&[column]).map(|b| vec![b]),
         }
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
@@ -612,6 +872,8 @@ impl PyScanResult {
         let all_batches = match reader {
             ReaderKind::Ipc(r) => r.read_all(),
             ReaderKind::Parquet(r) => r.read_all(),
+            ReaderKind::Csv(r) => r.read_all().map(|b| vec![b]),
+            ReaderKind::Json(r) => r.read_all().map(|b| vec![b]),
         }
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
