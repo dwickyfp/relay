@@ -306,7 +306,7 @@ impl PyScanResult {
     ///
     /// This is faster than `read_all().agg()` because it only reads the target column.
     fn agg_column(&self, py: Python<'_>, op: &str, column: &str) -> PyResult<Py<PyAny>> {
-        use relay_expr::{aggregate_array, AggOp};
+        use relay_expr::AggOp;
 
         let agg_op = match op.to_lowercase().as_str() {
             "sum" => AggOp::Sum,
@@ -322,178 +322,124 @@ impl PyScanResult {
             }
         };
 
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
-            })?;
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+        })?;
 
-        // Read only the target column (projection pushdown)
-        let batches = reader
-            .read_columns(&[column])
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-
-        if batches.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err("no batches"));
-        }
-
-        // For sum/count: parallel per-batch aggregate + reduce (skip concat)
-        // For min/max: parallel per-batch + reduce
-        // For mean: parallel sum + count, then divide
-        use arrow::array::{Float64Array, Int64Array};
-        use arrow::datatypes::DataType;
-
-        let result = match agg_op {
-            AggOp::Sum | AggOp::Count | AggOp::Min | AggOp::Max => {
-                // Determine data type from first batch
-                let dt = batches[0].column(0).data_type().clone();
-                match dt {
-                    DataType::Int64 => {
-                        let partials: Vec<i64> = batches
-                            .iter()
-                            .map(|b| {
-                                let arr = b.column(0);
-                                let i64_arr =
-                                    arr.as_any().downcast_ref::<Int64Array>().unwrap();
-                                match agg_op {
-                                    AggOp::Sum => {
-                                        arrow::compute::sum(i64_arr).unwrap_or(0)
-                                    }
-                                    AggOp::Count => {
-                                        (arr.len() - arr.null_count()) as i64
-                                    }
-                                    AggOp::Min => {
-                                        arrow::compute::min(i64_arr).unwrap_or(i64::MAX)
-                                    }
-                                    AggOp::Max => {
-                                        arrow::compute::max(i64_arr).unwrap_or(i64::MIN)
-                                    }
-                                    _ => unreachable!(),
-                                }
-                            })
-                            .collect();
-
-                        let final_val = match agg_op {
-                            AggOp::Sum | AggOp::Count => partials.iter().sum(),
-                            AggOp::Min => {
-                                partials.iter().copied().min().unwrap_or(0)
-                            }
-                            AggOp::Max => {
-                                partials.iter().copied().max().unwrap_or(0)
-                            }
-                            _ => unreachable!(),
-                        };
-                        relay_expr::AggResult::Int64(final_val)
-                    }
-                    DataType::Float64 => {
-                        let partials: Vec<f64> = batches
-                            .iter()
-                            .map(|b| {
-                                let arr = b.column(0);
-                                let f64_arr =
-                                    arr.as_any().downcast_ref::<Float64Array>().unwrap();
-                                match agg_op {
-                                    AggOp::Sum => {
-                                        arrow::compute::sum(f64_arr).unwrap_or(0.0)
-                                    }
-                                    AggOp::Count => {
-                                        (arr.len() - arr.null_count()) as f64
-                                    }
-                                    AggOp::Min => {
-                                        arrow::compute::min(f64_arr).unwrap_or(f64::MAX)
-                                    }
-                                    AggOp::Max => {
-                                        arrow::compute::max(f64_arr).unwrap_or(f64::MIN)
-                                    }
-                                    _ => unreachable!(),
-                                }
-                            })
-                            .collect();
-
-                        let final_val = match agg_op {
-                            AggOp::Sum | AggOp::Count => partials.iter().sum(),
-                            AggOp::Min => {
-                                partials.iter().copied().fold(f64::MAX, f64::min)
-                            }
-                            AggOp::Max => {
-                                partials.iter().copied().fold(f64::MIN, f64::max)
-                            }
-                            _ => unreachable!(),
-                        };
-                        relay_expr::AggResult::Float64(final_val)
-                    }
-                    _ => {
-                        // Fallback: concat + aggregate
-                        let col_chunks: Vec<&dyn arrow::array::Array> =
-                            batches.iter().map(|b| b.column(0).as_ref()).collect();
-                        let concatenated = arrow::compute::concat(&col_chunks)
-                            .map_err(|e| {
-                                pyo3::exceptions::PyValueError::new_err(e.to_string())
-                            })?;
-                        aggregate_array(concatenated.as_ref(), agg_op)
-                            .map_err(|e| {
-                                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-                            })?
-                    }
-                }
-            }
-            AggOp::Mean => {
-                let dt = batches[0].column(0).data_type().clone();
-                match dt {
-                    DataType::Int64 => {
-                        let mut total_sum: i64 = 0;
-                        let mut total_count: i64 = 0;
-                        for b in &batches {
-                            let arr = b.column(0);
-                            let i64_arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-                            total_sum += arrow::compute::sum(i64_arr).unwrap_or(0);
-                            total_count += (arr.len() - arr.null_count()) as i64;
-                        }
-                        if total_count == 0 {
-                            relay_expr::AggResult::Null
-                        } else {
-                            relay_expr::AggResult::Float64(total_sum as f64 / total_count as f64)
-                        }
-                    }
-                    DataType::Float64 => {
-                        let mut total_sum: f64 = 0.0;
-                        let mut total_count: usize = 0;
-                        for b in &batches {
-                            let arr = b.column(0);
-                            let f64_arr =
-                                arr.as_any().downcast_ref::<Float64Array>().unwrap();
-                            total_sum += arrow::compute::sum(f64_arr).unwrap_or(0.0);
-                            total_count += arr.len() - arr.null_count();
-                        }
-                        if total_count == 0 {
-                            relay_expr::AggResult::Null
-                        } else {
-                            relay_expr::AggResult::Float64(total_sum / total_count as f64)
-                        }
-                    }
-                    _ => {
-                        let col_chunks: Vec<&dyn arrow::array::Array> =
-                            batches.iter().map(|b| b.column(0).as_ref()).collect();
-                        let concatenated = arrow::compute::concat(&col_chunks)
-                            .map_err(|e| {
-                                pyo3::exceptions::PyValueError::new_err(e.to_string())
-                            })?;
-                        aggregate_array(concatenated.as_ref(), agg_op)
-                            .map_err(|e| {
-                                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
-                            })?
-                    }
-                }
-            }
+        // Use streaming aggregation for maximum performance
+        use relay_io::mmap::{AggOp as IoAggOp, AggResult as IoAggResult};
+        let io_agg_op = match agg_op {
+            AggOp::Sum => IoAggOp::Sum,
+            AggOp::Mean => IoAggOp::Mean,
+            AggOp::Min => IoAggOp::Min,
+            AggOp::Max => IoAggOp::Max,
+            AggOp::Count => IoAggOp::Count,
         };
+
+        let result = reader.streaming_agg(column, io_agg_op)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Convert to Python
         match result {
-            relay_expr::AggResult::Int64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
-            relay_expr::AggResult::Float64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
-            relay_expr::AggResult::Null => Ok(py.None()),
+            IoAggResult::Int64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            IoAggResult::Float64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            IoAggResult::Null => Ok(py.None()),
         }
+    }
+
+    /// Filter with parallel execution and fused aggregation (fastest path).
+    ///
+    /// Args:
+    ///     filter_col: Column to filter on
+    ///     op: Filter operator ("<", "<=", ">", ">=", "==", "!=")
+    ///     threshold: Filter threshold (i64)
+    ///     agg_col: Column to aggregate after filtering
+    ///     agg_op: Aggregation operation ("sum", "mean", "min", "max", "count")
+    ///
+    /// Returns:
+    ///     The aggregated value after filtering.
+    ///
+    /// This is the fastest path — no materialization of filtered data, parallel per-batch processing.
+    fn filter_agg(&self, py: Python<'_>, filter_col: &str, op: &str, threshold: i64, agg_col: &str, agg_op: &str) -> PyResult<Py<PyAny>> {
+        use relay_io::mmap::{AggOp as IoAggOp, AggResult as IoAggResult};
+
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+        })?;
+
+        let io_agg_op = match agg_op.to_lowercase().as_str() {
+            "sum" => IoAggOp::Sum,
+            "mean" | "avg" => IoAggOp::Mean,
+            "min" => IoAggOp::Min,
+            "max" => IoAggOp::Max,
+            "count" => IoAggOp::Count,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid aggregation: {}. Use sum, mean, min, max, count",
+                    agg_op
+                )))
+            }
+        };
+
+        let result = reader.parallel_filter_agg_i64(filter_col, op, threshold, agg_col, io_agg_op)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Convert to Python
+        match result {
+            IoAggResult::Int64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            IoAggResult::Float64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            IoAggResult::Null => Ok(py.None()),
+        }
+    }
+
+    /// Filter with parallel execution (returns filtered RecordBatch).
+    ///
+    /// Args:
+    ///     filter_col: Column to filter on
+    ///     op: Filter operator ("<", "<=", ">", ">=", "==", "!=")
+    ///     threshold: Filter threshold (i64)
+    ///
+    /// Returns:
+    ///     PyRelayBatch with filtered rows.
+    fn filter_parallel(&self, filter_col: &str, op: &str, threshold: i64) -> PyResult<PyRelayBatch> {
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+        })?;
+
+        let batches = reader.parallel_filter_i64(filter_col, op, threshold)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        if batches.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err("no results"));
+        }
+
+        // Concatenate batches
+        let schema = batches[0].schema();
+        let num_cols = schema.fields().len();
+        let mut col_data: Vec<Vec<arrow_array::ArrayRef>> = vec![Vec::new(); num_cols];
+        for batch in &batches {
+            for (i, col) in batch.columns().iter().enumerate() {
+                col_data[i].push(col.clone());
+            }
+        }
+
+        let mut result_cols = Vec::with_capacity(num_cols);
+        for col_chunks in &col_data {
+            let refs: Vec<&dyn arrow::array::Array> = col_chunks.iter().map(|c| c.as_ref()).collect();
+            let concatenated = arrow::compute::concat(&refs)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            result_cols.push(RelayArray::new(concatenated));
+        }
+
+        let result_batch = RelayRecordBatch::new(
+            schema.fields().iter().map(|f| f.name().clone()).collect(),
+            result_cols,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        Ok(PyRelayBatch {
+            inner: result_batch,
+        })
     }
 
     /// Filter with projection pushdown (only reads filter column, then applies mask).

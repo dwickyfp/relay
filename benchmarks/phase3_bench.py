@@ -1,8 +1,8 @@
 """
-Phase 3 Benchmark (Optimized): Projection Pushdown + SIMD Kernels
+Phase 3 Benchmark (Optimized): Projection Pushdown + SIMD Kernels + Parallel
 ==================================================================
 Fair comparison: all engines read only the columns they need.
-Relay uses agg_column() for projection pushdown.
+Relay uses agg_column() for projection pushdown + Rayon parallel.
 """
 import gc
 import os
@@ -19,8 +19,8 @@ import duckdb
 import pandas as pd
 import numpy as np
 
-WARMUP = 2
-ITERATIONS = 5
+WARMUP = 3
+ITERATIONS = 7
 DATA_DIR = tempfile.mkdtemp(prefix="relay_p3_bench_")
 
 
@@ -115,7 +115,7 @@ def bench_aggregate():
     for n in SIZES:
         ipc_p, pq_p = create_files(os.path.join(DATA_DIR, f"agg_{n}"), n)
 
-        # Relay: agg_column (projection pushdown — reads only col_0)
+        # Relay: agg_column (projection pushdown + Rayon parallel)
         def relay_v3():
             sr = _relay.scan(ipc_p)
             return sr.agg_column("sum", "col_0")
@@ -145,31 +145,37 @@ def bench_aggregate():
         t_pd = benchmark(lambda: pd.read_parquet(pq_p)["col_0"].sum())
 
         print(f"\n  n={n:>10,}")
-        print(f"    {'Relay (pushdown)':>16}: {fmt(t_relay_v3):>10}")
-        print(f"    {'Relay (old)':>16}: {fmt(t_relay_old):>10}")
-        print(f"    {'PyArrow':>16}: {fmt(t_pa):>10}")
-        print(f"    {'Polars':>16}: {fmt(t_pl):>10}")
-        print(f"    {'DuckDB':>16}: {fmt(t_db):>10}")
-        print(f"    {'Pandas':>16}: {fmt(t_pd):>10}")
+        print(f"    {'Relay (parallel)':>18}: {fmt(t_relay_v3):>10}")
+        print(f"    {'Relay (old)':>18}: {fmt(t_relay_old):>10}")
+        print(f"    {'PyArrow':>18}: {fmt(t_pa):>10}")
+        print(f"    {'Polars':>18}: {fmt(t_pl):>10}")
+        print(f"    {'DuckDB':>18}: {fmt(t_db):>10}")
+        print(f"    {'Pandas':>18}: {fmt(t_pd):>10}")
 
         os.unlink(ipc_p)
         os.unlink(pq_p)
 
 
 def bench_filter_then_aggregate():
-    """Combined filter+aggregate pipeline."""
-    print_header("FILTER + AGGREGATE (SUM col_0 WHERE col_0 < N/2)")
+    """Combined filter+aggregate pipeline — uses fused parallel path."""
+    print_header("FILTER + AGGREGATE (SUM col_0 WHERE col_0 < N/2) — fused parallel")
     for n in SIZES:
         ipc_p, pq_p = create_files(os.path.join(DATA_DIR, f"fa_{n}"), n)
         threshold = n // 2
 
-        # Relay: filter + agg
-        def relay_v3():
+        # Relay: fused filter+agg (parallel, no materialization, fastest)
+        def relay_fused():
+            sr = _relay.scan(ipc_p)
+            return sr.filter_agg("col_0", "<", threshold, "col_0", "sum")
+        t_relay_fused = benchmark(relay_fused)
+
+        # Relay: old path (read_all + filter + agg)
+        def relay_old():
             sr = _relay.scan(ipc_p)
             batch = sr.read_all()
             filtered = batch.filter("col_0", "<", threshold)
             return filtered.agg("sum", "col_0")
-        t_relay_v3 = benchmark(relay_v3)
+        t_relay_old = benchmark(relay_old)
 
         # Polars (lazy: filter + agg, projection pushdown)
         t_pl = benchmark(lambda: pl.scan_parquet(pq_p).filter(pl.col("col_0") < threshold).select(pl.col("col_0").sum()).collect())
@@ -178,9 +184,10 @@ def bench_filter_then_aggregate():
         t_db = benchmark(lambda: duckdb.query(f"SELECT sum(col_0) FROM '{pq_p}' WHERE col_0 < {threshold}").fetchone())
 
         print(f"\n  n={n:>10,}")
-        print(f"    {'Relay':>12}: {fmt(t_relay_v3):>10}")
-        print(f"    {'Polars':>12}: {fmt(t_pl):>10}")
-        print(f"    {'DuckDB':>12}: {fmt(t_db):>10}")
+        print(f"    {'Relay (fused)':>14}: {fmt(t_relay_fused):>10}")
+        print(f"    {'Relay (old)':>14}: {fmt(t_relay_old):>10}")
+        print(f"    {'Polars':>14}: {fmt(t_pl):>10}")
+        print(f"    {'DuckDB':>14}: {fmt(t_db):>10}")
 
         os.unlink(ipc_p)
         os.unlink(pq_p)
@@ -216,8 +223,8 @@ def bench_projection():
 
 if __name__ == "__main__":
     print("######################################################################")
-    print("  PHASE 3 BENCHMARK (OPTIMIZED) — Projection Pushdown + SIMD Kernels")
-    print(f"  Relay v0.4.0 | Polars {pl.__version__} | DuckDB 1.5.3 | PyArrow {pa.__version__}")
+    print("  PHASE 3 BENCHMARK (OPTIMIZED) — Parallel + Projection Pushdown")
+    print(f"  Relay v0.5.0 | Polars {pl.__version__} | DuckDB 1.5.3 | PyArrow {pa.__version__}")
     print("######################################################################")
 
     bench_filter()

@@ -9,6 +9,8 @@ description = "Storage adapters (IPC, Parquet, Vortex, Lance)"
 [dependencies]
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-ord = { workspace = true }
+rayon = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-buffer = { workspace = true }
