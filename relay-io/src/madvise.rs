@@ -40,11 +40,7 @@ pub fn apply_madvise(mmap: &Mmap, pattern: AccessPattern) {
     };
 
     unsafe {
-        libc::madvise(
-            mmap.as_ptr() as *mut libc::c_void,
-            mmap.len(),
-            advice,
-        );
+        libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), advice);
     }
 }
 

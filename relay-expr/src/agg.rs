@@ -30,16 +30,15 @@ impl std::fmt::Display for AggOp {
 }
 
 /// Aggregate an array using SIMD-optimized Arrow kernels
-pub fn aggregate_array(
-    array: &dyn Array,
-    op: AggOp,
-) -> Result<AggResult, RelayError> {
+pub fn aggregate_array(array: &dyn Array, op: AggOp) -> Result<AggResult, RelayError> {
     match op {
         AggOp::Sum => aggregate_sum(array),
         AggOp::Mean => aggregate_mean(array),
         AggOp::Min => aggregate_min(array),
         AggOp::Max => aggregate_max(array),
-        AggOp::Count => Ok(AggResult::Int64(array.len() as i64 - array.null_count() as i64)),
+        AggOp::Count => Ok(AggResult::Int64(
+            array.len() as i64 - array.null_count() as i64,
+        )),
     }
 }
 
@@ -74,7 +73,10 @@ fn aggregate_sum(array: &dyn Array) -> Result<AggResult, RelayError> {
             Ok(AggResult::Float64(sum))
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
             let sum: i64 = arrow::compute::sum(arr).map(|v: i32| v as i64).unwrap_or(0);
             Ok(AggResult::Int64(sum))
         }
@@ -100,7 +102,10 @@ fn aggregate_mean(array: &dyn Array) -> Result<AggResult, RelayError> {
             Ok(AggResult::Float64(sum / count as f64))
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
             let sum: i64 = arrow::compute::sum(arr).map(|v: i32| v as i64).unwrap_or(0);
             Ok(AggResult::Float64(sum as f64 / count as f64))
         }
@@ -127,7 +132,10 @@ fn aggregate_min(array: &dyn Array) -> Result<AggResult, RelayError> {
             }
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
             let min = arrow::compute::min(arr);
             match min {
                 Some(v) => Ok(AggResult::Int64(v as i64)),
@@ -157,7 +165,10 @@ fn aggregate_max(array: &dyn Array) -> Result<AggResult, RelayError> {
             }
         }
         DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
             let max = arrow::compute::max(arr);
             match max {
                 Some(v) => Ok(AggResult::Int64(v as i64)),

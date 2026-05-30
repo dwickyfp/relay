@@ -10,3 +10,5 @@ __pycache__/
 *.svg
 bench-results/
 .venv/
+*.so
+__pycache__/

@@ -9,9 +9,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyCapsule};
 use relay_arrow::ffi;
 use relay_arrow::{RelayArray, RelayRecordBatch};
-use relay_io::mmap::MmapIPCReader;
 use relay_io::ipc::write_ipc;
+use relay_io::mmap::MmapIPCReader;
+use relay_io::parquet::ParquetReader;
 // use relay_io::AccessPattern;
+
+/// Unified reader that wraps either IPC or Parquet reader
+enum ReaderKind {
+    Ipc(MmapIPCReader),
+    Parquet(ParquetReader),
+}
 
 #[pymodule]
 fn _relay(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -30,6 +37,7 @@ fn _relay(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(test_zero_copy, m)?)?;
     m.add_function(wrap_pyfunction!(benchmark_export_throughput, m)?)?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
+    m.add_function(wrap_pyfunction!(scan_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(write_ipc_file, m)?)?;
     Ok(())
 }
@@ -122,6 +130,12 @@ fn test_zero_copy(n: usize) -> (usize, usize) {
 /// The actual data lives in the mmap region — no copies until explicitly requested.
 #[pyfunction]
 fn scan(path: &str) -> PyResult<PyScanResult> {
+    // Auto-detect format based on file extension
+    let path_lower = path.to_lowercase();
+    if path_lower.ends_with(".parquet") || path_lower.ends_with(".pq") {
+        return scan_parquet(path);
+    }
+
     let reader = MmapIPCReader::open(std::path::Path::new(path))
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
@@ -135,11 +149,41 @@ fn scan(path: &str) -> PyResult<PyScanResult> {
         .collect();
 
     Ok(PyScanResult {
-        reader: Some(reader),
+        reader: Some(ReaderKind::Ipc(reader)),
         path: path.to_string(),
         num_rows,
         num_columns,
         column_names,
+        format: "ipc".to_string(),
+    })
+}
+
+/// Scan a Parquet file with row group pruning, column projection, and parallel processing.
+///
+/// Returns a PyScanResult that provides batch-by-batch access to the data.
+/// Supports row group pruning (skip entire row groups using statistics) and
+/// column projection (only decode needed columns).
+#[pyfunction]
+fn scan_parquet(path: &str) -> PyResult<PyScanResult> {
+    let reader = ParquetReader::open(std::path::Path::new(path))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+    let num_rows = reader.num_rows();
+    let num_columns = reader.schema().fields().len();
+    let column_names: Vec<String> = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    Ok(PyScanResult {
+        reader: Some(ReaderKind::Parquet(reader)),
+        path: path.to_string(),
+        num_rows,
+        num_columns,
+        column_names,
+        format: "parquet".to_string(),
     })
 }
 
@@ -155,14 +199,15 @@ fn write_ipc_file(path: &str, batch: &PyRelayBatch) -> PyResult<()> {
     .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
 }
 
-/// Result from scanning an IPC file. Provides batch-by-batch access.
+/// Result from scanning an IPC or Parquet file. Provides batch-by-batch access.
 #[pyclass(name = "ScanResult")]
 pub struct PyScanResult {
-    reader: Option<MmapIPCReader>,
+    reader: Option<ReaderKind>,
     path: String,
     num_rows: usize,
     num_columns: usize,
     column_names: Vec<String>,
+    format: String,
 }
 
 #[pymethods]
@@ -189,19 +234,28 @@ impl PyScanResult {
 
     #[getter]
     fn mmap_size(&self) -> usize {
-        self.reader.as_ref().map(|r| r.mmap_size()).unwrap_or(0)
+        match self.reader.as_ref() {
+            Some(ReaderKind::Ipc(r)) => r.mmap_size(),
+            _ => 0, // Parquet files aren't mmap'd
+        }
+    }
+
+    #[getter]
+    fn format(&self) -> &str {
+        &self.format
     }
 
     /// Read a specific batch as a PyRelayBatch.
     fn read_batch(&mut self, index: usize) -> PyResult<PyRelayBatch> {
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ScanResult already consumed"))?;
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+        })?;
 
-        let batch = reader
-            .read_batch(index)
-            .map_err(|e| pyo3::exceptions::PyIndexError::new_err(e.to_string()))?;
+        let batch = match reader {
+            ReaderKind::Ipc(r) => r.read_batch(index),
+            ReaderKind::Parquet(r) => r.read_batch(index),
+        }
+        .map_err(|e| pyo3::exceptions::PyIndexError::new_err(e.to_string()))?;
 
         let relay_batch = RelayRecordBatch::from_arrow(batch);
         Ok(PyRelayBatch { inner: relay_batch })
@@ -209,14 +263,15 @@ impl PyScanResult {
 
     /// Read all batches as a single PyRelayBatch.
     fn read_all(&mut self) -> PyResult<PyRelayBatch> {
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ScanResult already consumed"))?;
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+        })?;
 
-        let batches = reader
-            .read_all()
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let batches = match reader {
+            ReaderKind::Ipc(r) => r.read_all(),
+            ReaderKind::Parquet(r) => r.read_all(),
+        }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         // Concatenate all batches into one
         if batches.is_empty() {
@@ -237,7 +292,8 @@ impl PyScanResult {
         // Concatenate each column
         let mut result_cols = Vec::with_capacity(num_cols);
         for col_chunks in &columns {
-            let refs: Vec<&dyn arrow::array::Array> = col_chunks.iter().map(|c| c.as_ref()).collect();
+            let refs: Vec<&dyn arrow::array::Array> =
+                col_chunks.iter().map(|c| c.as_ref()).collect();
             let concatenated = arrow::compute::concat(&refs)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
             result_cols.push(RelayArray::new(concatenated));
@@ -249,20 +305,23 @@ impl PyScanResult {
         )
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-        Ok(PyRelayBatch { inner: result_batch })
+        Ok(PyRelayBatch {
+            inner: result_batch,
+        })
     }
 
     /// Read specific columns only (projection pushdown).
     fn read_columns(&self, columns: Vec<String>) -> PyResult<PyRelayBatch> {
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ScanResult already consumed"))?;
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+        })?;
 
         let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        let batches = reader
-            .read_columns(&col_refs)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let batches = match reader {
+            ReaderKind::Ipc(r) => r.read_columns(&col_refs),
+            ReaderKind::Parquet(r) => r.read_columns(&col_refs),
+        }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         if batches.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err("no batches"));
@@ -280,7 +339,8 @@ impl PyScanResult {
 
         let mut result_cols = Vec::with_capacity(num_cols);
         for col_chunks in &col_data {
-            let refs: Vec<&dyn arrow::array::Array> = col_chunks.iter().map(|c| c.as_ref()).collect();
+            let refs: Vec<&dyn arrow::array::Array> =
+                col_chunks.iter().map(|c| c.as_ref()).collect();
             let concatenated = arrow::compute::concat(&refs)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
             result_cols.push(RelayArray::new(concatenated));
@@ -292,7 +352,9 @@ impl PyScanResult {
         )
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-        Ok(PyRelayBatch { inner: result_batch })
+        Ok(PyRelayBatch {
+            inner: result_batch,
+        })
     }
 
     /// Aggregate a single column with projection pushdown (only reads needed column).
@@ -336,8 +398,11 @@ impl PyScanResult {
             AggOp::Count => IoAggOp::Count,
         };
 
-        let result = reader.streaming_agg(column, io_agg_op)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let result = match reader {
+            ReaderKind::Ipc(r) => r.streaming_agg(column, io_agg_op),
+            ReaderKind::Parquet(r) => r.streaming_agg(column, io_agg_op),
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Convert to Python
         match result {
@@ -360,7 +425,15 @@ impl PyScanResult {
     ///     The aggregated value after filtering.
     ///
     /// This is the fastest path — no materialization of filtered data, parallel per-batch processing.
-    fn filter_agg(&self, py: Python<'_>, filter_col: &str, op: &str, threshold: i64, agg_col: &str, agg_op: &str) -> PyResult<Py<PyAny>> {
+    fn filter_agg(
+        &self,
+        py: Python<'_>,
+        filter_col: &str,
+        op: &str,
+        threshold: i64,
+        agg_col: &str,
+        agg_op: &str,
+    ) -> PyResult<Py<PyAny>> {
         use relay_io::mmap::{AggOp as IoAggOp, AggResult as IoAggResult};
 
         let reader = self.reader.as_ref().ok_or_else(|| {
@@ -381,8 +454,15 @@ impl PyScanResult {
             }
         };
 
-        let result = reader.parallel_filter_agg_i64(filter_col, op, threshold, agg_col, io_agg_op)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let result = match reader {
+            ReaderKind::Ipc(r) => {
+                r.parallel_filter_agg_i64(filter_col, op, threshold, agg_col, io_agg_op)
+            }
+            ReaderKind::Parquet(r) => {
+                r.parallel_filter_agg_i64(filter_col, op, threshold, agg_col, io_agg_op)
+            }
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Convert to Python
         match result {
@@ -401,13 +481,21 @@ impl PyScanResult {
     ///
     /// Returns:
     ///     PyRelayBatch with filtered rows.
-    fn filter_parallel(&self, filter_col: &str, op: &str, threshold: i64) -> PyResult<PyRelayBatch> {
+    fn filter_parallel(
+        &self,
+        filter_col: &str,
+        op: &str,
+        threshold: i64,
+    ) -> PyResult<PyRelayBatch> {
         let reader = self.reader.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
         })?;
 
-        let batches = reader.parallel_filter_i64(filter_col, op, threshold)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let batches = match reader {
+            ReaderKind::Ipc(r) => r.parallel_filter_i64(filter_col, op, threshold),
+            ReaderKind::Parquet(r) => r.parallel_filter_i64(filter_col, op, threshold),
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         if batches.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err("no results"));
@@ -425,7 +513,8 @@ impl PyScanResult {
 
         let mut result_cols = Vec::with_capacity(num_cols);
         for col_chunks in &col_data {
-            let refs: Vec<&dyn arrow::array::Array> = col_chunks.iter().map(|c| c.as_ref()).collect();
+            let refs: Vec<&dyn arrow::array::Array> =
+                col_chunks.iter().map(|c| c.as_ref()).collect();
             let concatenated = arrow::compute::concat(&refs)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
             result_cols.push(RelayArray::new(concatenated));
@@ -459,8 +548,8 @@ impl PyScanResult {
         op: &str,
         value: &Bound<'_, pyo3::types::PyAny>,
     ) -> PyResult<PyRelayBatch> {
-        use relay_expr::{Expr, Literal, Operator};
         use relay_expr::filter::filter_batch;
+        use relay_expr::{Expr, Literal, Operator};
 
         let operator = match op {
             "==" | "eq" => Operator::Eq,
@@ -469,9 +558,12 @@ impl PyScanResult {
             "<=" | "le" => Operator::Le,
             ">" | "gt" => Operator::Gt,
             ">=" | "ge" => Operator::Ge,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Invalid operator: {}. Use ==, !=, <, <=, >, >=", op)
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid operator: {}. Use ==, !=, <, <=, >, >=",
+                    op
+                )))
+            }
         };
 
         let literal = if let Ok(v) = value.extract::<i64>() {
@@ -482,19 +574,20 @@ impl PyScanResult {
             Literal::Str(v)
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Value must be int, float, or string"
+                "Value must be int, float, or string",
             ));
         };
 
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ScanResult already consumed"))?;
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+        })?;
 
         // Read only the filter column first
-        let filter_batches = reader
-            .read_columns(&[column])
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let filter_batches = match reader {
+            ReaderKind::Ipc(r) => r.read_columns(&[column]),
+            ReaderKind::Parquet(r) => r.read_columns(&[column]),
+        }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         if filter_batches.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err("no batches"));
@@ -516,9 +609,11 @@ impl PyScanResult {
         }
 
         // Now read all columns but only for the filtered rows
-        let all_batches = reader
-            .read_all()
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        let all_batches = match reader {
+            ReaderKind::Ipc(r) => r.read_all(),
+            ReaderKind::Parquet(r) => r.read_all(),
+        }
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
 
         // Apply the same filter to all batches
         let mut result_batches = Vec::new();
@@ -544,7 +639,8 @@ impl PyScanResult {
 
         let mut result_cols = Vec::with_capacity(num_cols);
         for col_chunks in &col_data {
-            let refs: Vec<&dyn arrow::array::Array> = col_chunks.iter().map(|c| c.as_ref()).collect();
+            let refs: Vec<&dyn arrow::array::Array> =
+                col_chunks.iter().map(|c| c.as_ref()).collect();
             let concatenated = arrow::compute::concat(&refs)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
             result_cols.push(RelayArray::new(concatenated));
@@ -556,16 +652,15 @@ impl PyScanResult {
         )
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-        Ok(PyRelayBatch { inner: result_batch })
+        Ok(PyRelayBatch {
+            inner: result_batch,
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "ScanResult(path={}, rows={}, cols={}, mmap={}bytes)",
-            self.path,
-            self.num_rows,
-            self.num_columns,
-            self.mmap_size()
+            "ScanResult(path={}, rows={}, cols={}, format={})",
+            self.path, self.num_rows, self.num_columns, self.format,
         )
     }
 
@@ -732,15 +827,33 @@ impl PyRelayArray {
                 .collect()
         } else if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
             (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
+                .map(|i| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i) as f64)
+                    }
+                })
                 .collect()
         } else if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
             (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
+                .map(|i| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i) as f64)
+                    }
+                })
                 .collect()
         } else if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
             (0..a.len())
-                .map(|i| if a.is_null(i) { None } else { Some(a.value(i) as f64) })
+                .map(|i| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i) as f64)
+                    }
+                })
                 .collect()
         } else {
             vec![]
@@ -907,9 +1020,14 @@ impl PyRelayBatch {
     ///
     /// Example:
     ///     filtered = batch.filter("age", ">", 30)
-    fn filter(&self, column: &str, op: &str, value: &Bound<'_, pyo3::types::PyAny>) -> PyResult<PyRelayBatch> {
-        use relay_expr::{Expr, Literal, Operator};
+    fn filter(
+        &self,
+        column: &str,
+        op: &str,
+        value: &Bound<'_, pyo3::types::PyAny>,
+    ) -> PyResult<PyRelayBatch> {
         use relay_expr::filter::filter_batch;
+        use relay_expr::{Expr, Literal, Operator};
 
         let op = match op {
             "==" | "eq" => Operator::Eq,
@@ -918,9 +1036,12 @@ impl PyRelayBatch {
             "<=" | "le" => Operator::Le,
             ">" | "gt" => Operator::Gt,
             ">=" | "ge" => Operator::Ge,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Invalid operator: {}. Use ==, !=, <, <=, >, >=", op)
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid operator: {}. Use ==, !=, <, <=, >, >=",
+                    op
+                )))
+            }
         };
 
         // Try to extract value as different types
@@ -932,7 +1053,7 @@ impl PyRelayBatch {
             Literal::Str(v)
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Value must be int, float, or string"
+                "Value must be int, float, or string",
             ));
         };
 
@@ -962,7 +1083,7 @@ impl PyRelayBatch {
     /// Example:
     ///     total = batch.agg("sum", "amount")
     fn agg(&self, py: Python<'_>, op: &str, column: &str) -> PyResult<Py<PyAny>> {
-        use relay_expr::{AggOp, aggregate_array};
+        use relay_expr::{aggregate_array, AggOp};
 
         let agg_op = match op.to_lowercase().as_str() {
             "sum" => AggOp::Sum,
@@ -970,12 +1091,17 @@ impl PyRelayBatch {
             "min" => AggOp::Min,
             "max" => AggOp::Max,
             "count" => AggOp::Count,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Invalid aggregation: {}. Use sum, mean, min, max, count", op)
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid aggregation: {}. Use sum, mean, min, max, count",
+                    op
+                )))
+            }
         };
 
-        let col = self.inner.column_by_name(column)
+        let col = self
+            .inner
+            .column_by_name(column)
             .map_err(|e| pyo3::exceptions::PyKeyError::new_err(e.to_string()))?;
 
         let result = aggregate_array(col.as_arrow(), agg_op)

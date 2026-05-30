@@ -26,7 +26,7 @@ use crate::madvise::{apply_madvise, AccessPattern};
 use relay_core::{RelayError, Result};
 
 /// Compare Int64Array column against a scalar threshold using arrow_ord::cmp (SIMD).
-fn compare_i64_scalar(
+pub fn compare_i64_scalar(
     col: &Int64Array,
     op: &str,
     threshold: i64,
@@ -91,10 +91,7 @@ impl MmapIPCReader {
         // Memory-map the file (lazy — pages loaded on demand)
         let mmap = unsafe {
             MmapOptions::new().map(&file).map_err(|e| {
-                RelayError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("mmap failed: {}", e),
-                ))
+                RelayError::Io(std::io::Error::new(e.kind(), format!("mmap failed: {}", e)))
             })?
         };
 
@@ -225,9 +222,8 @@ impl MmapIPCReader {
 
         let mut batches = Vec::with_capacity(self.num_record_batches);
         for batch in reader {
-            batches.push(
-                batch.map_err(|e| RelayError::Arrow(format!("IPC projected read: {}", e)))?,
-            );
+            batches
+                .push(batch.map_err(|e| RelayError::Arrow(format!("IPC projected read: {}", e)))?);
         }
         Ok(batches)
     }
@@ -288,11 +284,7 @@ impl MmapIPCReader {
                 let partials: Vec<i64> = batches
                     .par_iter()
                     .map(|b| {
-                        let arr = b
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .unwrap();
+                        let arr = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
                         match op {
                             AggOp::Sum => arrow::compute::sum(arr).unwrap_or(0),
                             AggOp::Count => (arr.len() - arr.null_count()) as i64,
@@ -334,11 +326,7 @@ impl MmapIPCReader {
                 let partials: Vec<f64> = batches
                     .par_iter()
                     .map(|b| {
-                        let arr = b
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .unwrap();
+                        let arr = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
                         match op {
                             AggOp::Sum => arrow::compute::sum(arr).unwrap_or(0.0),
                             AggOp::Count => (arr.len() - arr.null_count()) as f64,
@@ -551,15 +539,13 @@ impl MmapIPCReader {
 
                 // Reduce
                 match agg_op {
-                    AggOp::Sum | AggOp::Count => {
-                        Ok(AggResult::Int64(partials.iter().sum()))
-                    }
-                    AggOp::Min => {
-                        Ok(AggResult::Int64(partials.iter().copied().min().unwrap_or(0)))
-                    }
-                    AggOp::Max => {
-                        Ok(AggResult::Int64(partials.iter().copied().max().unwrap_or(0)))
-                    }
+                    AggOp::Sum | AggOp::Count => Ok(AggResult::Int64(partials.iter().sum())),
+                    AggOp::Min => Ok(AggResult::Int64(
+                        partials.iter().copied().min().unwrap_or(0),
+                    )),
+                    AggOp::Max => Ok(AggResult::Int64(
+                        partials.iter().copied().max().unwrap_or(0),
+                    )),
                     _ => unreachable!(),
                 }
             }
@@ -639,14 +625,11 @@ impl MmapIPCReader {
         for batch_idx in 0..num_batches {
             let batch = self.read_batch_projected(batch_idx, &[col_idx])?;
             let col = batch.column(0);
-            
+
             match col.data_type() {
                 DataType::Int64 => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap();
-                    
+                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+
                     match op {
                         AggOp::Sum | AggOp::Mean => {
                             let batch_sum = arrow::compute::sum(arr).unwrap_or(0);
@@ -669,11 +652,8 @@ impl MmapIPCReader {
                     }
                 }
                 DataType::Float64 => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .unwrap();
-                    
+                    let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+
                     match op {
                         AggOp::Sum | AggOp::Mean => {
                             let batch_sum = arrow::compute::sum(arr).unwrap_or(0.0);
@@ -722,7 +702,9 @@ impl MmapIPCReader {
                 if total_count == 0 {
                     Ok(AggResult::Null)
                 } else if min_val_i64 != i64::MAX || max_val_i64 != i64::MIN {
-                    Ok(AggResult::Float64(total_sum_i64 as f64 / total_count as f64))
+                    Ok(AggResult::Float64(
+                        total_sum_i64 as f64 / total_count as f64,
+                    ))
                 } else {
                     Ok(AggResult::Float64(total_sum_f64 / total_count as f64))
                 }
@@ -913,7 +895,12 @@ mod tests {
     fn test_batch_row_counts_cached() {
         let batch = create_test_batch();
         let tmp = NamedTempFile::new().unwrap();
-        write_ipc(tmp.path(), &[batch.clone(), batch], IPCWriteOptions::default()).unwrap();
+        write_ipc(
+            tmp.path(),
+            &[batch.clone(), batch],
+            IPCWriteOptions::default(),
+        )
+        .unwrap();
 
         let reader = MmapIPCReader::open(tmp.path()).unwrap();
         assert_eq!(reader.batch_row_count(0), Some(5));

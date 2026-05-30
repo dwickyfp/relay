@@ -101,12 +101,10 @@ impl RelayRecordBatch {
 
     /// Get a column by index (zero-copy).
     pub fn column(&self, index: usize) -> Result<&RelayArray> {
-        self.columns
-            .get(index)
-            .ok_or(RelayError::OutOfBounds {
-                index,
-                len: self.columns.len(),
-            })
+        self.columns.get(index).ok_or(RelayError::OutOfBounds {
+            index,
+            len: self.columns.len(),
+        })
     }
 
     /// Get a column by name (zero-copy).

@@ -93,14 +93,16 @@ impl QueryPlan {
                     indices.push(idx);
                 }
             }
-            let projected_cols: Vec<_> = indices.iter().map(|&i| current.column(i).clone()).collect();
-            let projected_fields: Vec<_> = indices.iter().map(|&i| current.schema().field(i).clone()).collect();
-            let projected_schema = Arc::new(
-                arrow_schema::Schema::new_with_metadata(
-                    projected_fields,
-                    current.schema().metadata().clone(),
-                ),
-            );
+            let projected_cols: Vec<_> =
+                indices.iter().map(|&i| current.column(i).clone()).collect();
+            let projected_fields: Vec<_> = indices
+                .iter()
+                .map(|&i| current.schema().field(i).clone())
+                .collect();
+            let projected_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+                projected_fields,
+                current.schema().metadata().clone(),
+            ));
             current = RecordBatch::try_new(projected_schema, projected_cols)
                 .map_err(|e| relay_core::RelayError::Arrow(format!("projection: {}", e)))?;
         }
@@ -109,15 +111,9 @@ impl QueryPlan {
         if !self.aggregations.is_empty() {
             let mut results = Vec::new();
             for agg_expr in &self.aggregations {
-                let col_idx = current
-                    .schema()
-                    .index_of(&agg_expr.column)
-                    .map_err(|_| {
-                        relay_core::RelayError::Arrow(format!(
-                            "column not found: {}",
-                            agg_expr.column
-                        ))
-                    })?;
+                let col_idx = current.schema().index_of(&agg_expr.column).map_err(|_| {
+                    relay_core::RelayError::Arrow(format!("column not found: {}", agg_expr.column))
+                })?;
                 let col = current.column(col_idx);
                 let result = aggregate_array(col.as_ref(), agg_expr.op)?;
                 results.push((agg_expr.alias.clone(), result));

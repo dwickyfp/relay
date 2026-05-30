@@ -147,7 +147,11 @@ fn compare_col_col(
 
 /// Generic comparison dispatch via arrow_ord::cmp SIMD kernels.
 #[inline(always)]
-fn apply_cmp(lhs: &dyn arrow::array::Datum, rhs: &dyn arrow::array::Datum, op: Operator) -> Result<BooleanArray> {
+fn apply_cmp(
+    lhs: &dyn arrow::array::Datum,
+    rhs: &dyn arrow::array::Datum,
+    op: Operator,
+) -> Result<BooleanArray> {
     let result = match op {
         Operator::Lt => lt(lhs, rhs),
         Operator::Le => lt_eq(lhs, rhs),
@@ -181,10 +185,7 @@ fn resolve_datum(batch: &RecordBatch, expr: &Expr) -> Result<Arc<dyn Array>> {
             };
             Ok(arr)
         }
-        _ => Err(RelayError::Expr(format!(
-            "Cannot resolve: {}",
-            expr
-        ))),
+        _ => Err(RelayError::Expr(format!("Cannot resolve: {}", expr))),
     }
 }
 
@@ -272,14 +273,18 @@ mod tests {
     #[test]
     fn test_and() {
         let b = sample_batch();
-        let e = Expr::col("id").gt(Expr::lit_i64(1)).and(Expr::col("id").lt(Expr::lit_i64(4)));
+        let e = Expr::col("id")
+            .gt(Expr::lit_i64(1))
+            .and(Expr::col("id").lt(Expr::lit_i64(4)));
         assert_eq!(filter_batch(&b, &e).unwrap().num_rows(), 2);
     }
 
     #[test]
     fn test_or() {
         let b = sample_batch();
-        let e = Expr::col("id").lt(Expr::lit_i64(2)).or(Expr::col("id").gt(Expr::lit_i64(4)));
+        let e = Expr::col("id")
+            .lt(Expr::lit_i64(2))
+            .or(Expr::col("id").gt(Expr::lit_i64(4)));
         assert_eq!(filter_batch(&b, &e).unwrap().num_rows(), 2);
     }
 

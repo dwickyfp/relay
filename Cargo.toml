@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/dwickyfp/relay"
@@ -28,6 +28,7 @@ arrow-schema = "58"
 arrow-ipc = "58"
 arrow-cast = "58"
 arrow-ord = "58"
+parquet = { version = "58", features = ["arrow", "snap", "lz4", "zstd", "flate2"] }
 rayon = "1"
 arrow-flight = "58"
 pyo3 = { version = "0.28", features = ["extension-module"] }

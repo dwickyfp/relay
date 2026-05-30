@@ -75,15 +75,19 @@ pub fn write_ipc(path: &Path, batches: &[RecordBatch], _options: IPCWriteOptions
 
 /// Write a single record batch to an IPC file (convenience function).
 pub fn write_single_batch(batch: &RecordBatch, path: &Path) -> Result<()> {
-    write_ipc(path, std::slice::from_ref(batch), IPCWriteOptions::default())
+    write_ipc(
+        path,
+        std::slice::from_ref(batch),
+        IPCWriteOptions::default(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Float64Array, Int32Array};
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     fn test_batch(n: usize) -> RecordBatch {
