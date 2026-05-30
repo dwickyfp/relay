@@ -1,0 +1,11 @@
+[package]
+name = "relay-udf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UDF runtime (Rust plugins, Python, WASM)"
+
+[dependencies]
+arrow = { workspace = true }
+pyo3 = { workspace = true }

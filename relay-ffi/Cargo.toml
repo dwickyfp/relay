@@ -1,0 +1,10 @@
+[package]
+name = "relay-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C Data Interface export/import"
+
+[dependencies]
+arrow = { workspace = true }

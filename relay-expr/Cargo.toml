@@ -1,0 +1,11 @@
+[package]
+name = "relay-expr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Expression DSL, type inference, optimization"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-schema = { workspace = true }

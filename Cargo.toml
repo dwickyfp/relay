@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "relay-core",
+    "relay-arrow",
+    "relay-expr",
+    "relay-exec",
+    "relay-io",
+    "relay-udf",
+    "relay-memory",
+    "relay-python",
+    "relay-ffi",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/dwickyfp/relay"
+description = "Zero-copy data engine for Python, powered by Rust and Apache Arrow"
+readme = "README.md"
+
+[workspace.dependencies]
+arrow = "58"
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-schema = "58"
+arrow-ipc = "58"
+arrow-flight = "58"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3-arrow = "0.17"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+crossbeam = "0.8"
+parking_lot = "0.12"
+memmap2 = "0.9"
+ahash = "0.8"

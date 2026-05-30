@@ -1,0 +1,14 @@
+[package]
+name = "relay-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Execution engine (eager/lazy/streaming)"
+
+[dependencies]
+arrow = { workspace = true }
+tokio = { workspace = true }
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+ahash = { workspace = true }

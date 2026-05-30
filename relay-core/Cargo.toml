@@ -1,0 +1,11 @@
+[package]
+name = "relay-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types, schema, error handling"
+
+[dependencies]
+thiserror = { workspace = true }
+arrow-schema = { workspace = true }

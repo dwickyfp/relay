@@ -1,0 +1,12 @@
+[package]
+name = "relay-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage adapters (IPC, Parquet, Vortex, Lance)"
+
+[dependencies]
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+memmap2 = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "relay-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PyO3 bindings, Python API"
+
+[dependencies]
+pyo3 = { workspace = true }
+pyo3-arrow = { workspace = true }
+arrow = { workspace = true }

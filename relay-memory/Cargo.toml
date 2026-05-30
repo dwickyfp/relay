@@ -1,0 +1,11 @@
+[package]
+name = "relay-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Buffer pool, mmap manager, spill manager"
+
+[dependencies]
+memmap2 = { workspace = true }
+parking_lot = { workspace = true }
