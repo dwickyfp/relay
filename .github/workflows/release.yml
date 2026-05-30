@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.semver.outputs.new_release }}
+      version: ${{ steps.semver.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump
+        id: semver
+        run: |
+          # Get latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+
+          # Parse version
+          MAJOR=$(echo $LATEST_TAG | sed 's/v//' | cut -d. -f1)
+          MINOR=$(echo $LATEST_TAG | sed 's/v//' | cut -d. -f2)
+          PATCH=$(echo $LATEST_TAG | sed 's/v//' | cut -d. -f3)
+
+          # Get commits since last tag
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            COMMITS=$(git log --oneline)
+          else
+            COMMITS=$(git log ${LATEST_TAG}..HEAD --oneline)
+          fi
+
+          echo "Commits since $LATEST_TAG:"
+          echo "$COMMITS"
+
+          # Determine bump type based on conventional commits
+          # BREAKING CHANGE or ! → major
+          # feat: → minor
+          # fix:, docs:, refactor:, perf:, test:, chore: → patch
+
+          NEW_MAJOR=$MAJOR
+          NEW_MINOR=$MINOR
+          NEW_PATCH=$PATCH
+
+          if echo "$COMMITS" | grep -qE "BREAKING CHANGE|^[a-f0-9]+ .+!:"; then
+            echo "Detected BREAKING CHANGE → major bump"
+            NEW_MAJOR=$((MAJOR + 1))
+            NEW_MINOR=0
+            NEW_PATCH=0
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qE "^[a-f0-9]+ feat(\(.+\))?:"; then
+            echo "Detected feat → minor bump"
+            NEW_MINOR=$((MINOR + 1))
+            NEW_PATCH=0
+            BUMP="minor"
+          elif echo "$COMMITS" | grep -qE "^[a-f0-9]+ (fix|docs|refactor|perf|test|chore|ci|build|style)(\(.+\))?:"; then
+            echo "Detected fix/docs/refactor/etc → patch bump"
+            NEW_PATCH=$((PATCH + 1))
+            BUMP="patch"
+          else
+            echo "No conventional commits found, skipping release"
+            echo "new_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          NEW_VERSION="${NEW_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
+          echo "Bumping: $MAJOR.$MINOR.$PATCH → $NEW_VERSION ($BUMP)"
+
+          echo "new_release=true" >> $GITHUB_OUTPUT
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "bump=$BUMP" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        if: steps.semver.outputs.new_release == 'true'
+        run: |
+          VERSION="${{ steps.semver.outputs.version }}"
+          BUMP="${{ steps.semver.outputs.bump }}"
+
+          # Generate changelog from commits
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            CHANGELOG=$(git log --oneline --format="- %s (%h)")
+          else
+            CHANGELOG=$(git log ${LATEST_TAG}..HEAD --oneline --format="- %s (%h)")
+          fi
+
+          # Create tag
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "Release v${VERSION} (${BUMP})"
+          git push origin "v${VERSION}"
+
+          # Create GitHub Release
+          cat > /tmp/release-notes.md << EOF
+          ## Relay v${VERSION}
+
+          **Release type:** ${BUMP}
+
+          ### Changes
+          ${CHANGELOG}
+
+          ### Installation
+          \`\`\`bash
+          cargo add relay-core
+          pip install relay-engine
+          \`\`\`
+          EOF
+
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file /tmp/release-notes.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

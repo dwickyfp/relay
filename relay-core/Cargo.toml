@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core types, schema, error handling"
+description = "Core types, schema, error handling for Relay engine"
 
 [dependencies]
-thiserror = { workspace = true }
-arrow-schema = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]

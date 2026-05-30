@@ -1,9 +1,14 @@
-//! Core types, schema, error handling
+//! # Relay Core
+//!
+//! Core types, schema definitions, error handling, and shared utilities
+//! for the Relay zero-copy data engine.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert!(true);
-    }
-}
+pub mod config;
+pub mod error;
+pub mod schema;
+pub mod types;
+
+pub use config::RelayConfig;
+pub use error::{RelayError, Result};
+pub use schema::{RelayField, RelaySchema};
+pub use types::RelayType;

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arrow integration, FFI, mmap"
+description = "Arrow integration, array ops, FFI for Relay engine"
 
 [dependencies]
 arrow = { workspace = true }
@@ -12,3 +12,4 @@ arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
 memmap2 = { workspace = true }
+relay-core = { path = "../relay-core" }
