@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn test_filter_str() {
-        let arr = RelayArray::from_str(vec!["a", "b", "c", "d"]);
+        let arr = RelayArray::from_strs(vec!["a", "b", "c", "d"]);
         let mask = BooleanArray::from(vec![true, true, false, true]);
         let result = filter(&arr, &mask).unwrap();
         assert_eq!(result.len(), 3);

@@ -72,7 +72,7 @@ impl RelaySchema {
     pub fn field(&self, index: usize) -> Result<&RelayField> {
         self.fields
             .get(index)
-            .ok_or_else(|| RelayError::OutOfBounds {
+            .ok_or(RelayError::OutOfBounds {
                 index,
                 len: self.fields.len(),
             })

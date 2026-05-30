@@ -17,4 +17,5 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 relay-arrow = { path = "../relay-arrow" }
 relay-core = { path = "../relay-core" }
+relay-io = { path = "../relay-io" }
 bytemuck = { version = "1.23", features = ["derive"] }

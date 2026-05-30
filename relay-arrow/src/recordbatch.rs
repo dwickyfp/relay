@@ -3,8 +3,8 @@
 //! Analogous to Arrow's RecordBatch but with Relay-specific features.
 //! Supports zero-copy column selection and slicing.
 
-use arrow::array::{ArrayRef, RecordBatch, StructArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::array::{ArrayRef, RecordBatch};
+use arrow::datatypes::{Field, Schema as ArrowSchema};
 use std::sync::Arc;
 
 use crate::array::RelayArray;
@@ -103,7 +103,7 @@ impl RelayRecordBatch {
     pub fn column(&self, index: usize) -> Result<&RelayArray> {
         self.columns
             .get(index)
-            .ok_or_else(|| RelayError::OutOfBounds {
+            .ok_or(RelayError::OutOfBounds {
                 index,
                 len: self.columns.len(),
             })
@@ -174,12 +174,13 @@ impl RelayRecordBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::DataType;
 
     fn sample_batch() -> RelayRecordBatch {
         RelayRecordBatch::new(
             vec!["name".into(), "age".into(), "salary".into()],
             vec![
-                RelayArray::from_str(vec!["alice", "bob", "charlie"]),
+                RelayArray::from_strs(vec!["alice", "bob", "charlie"]),
                 RelayArray::from_i32(vec![25, 30, 35]),
                 RelayArray::from_f64(vec![50000.0, 60000.0, 70000.0]),
             ],

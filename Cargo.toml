@@ -26,6 +26,7 @@ arrow-array = "58"
 arrow-buffer = "58"
 arrow-schema = "58"
 arrow-ipc = "58"
+arrow-cast = "58"
 arrow-flight = "58"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 pyo3-arrow = "0.17"

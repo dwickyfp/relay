@@ -55,7 +55,7 @@ impl RelayArray {
     }
 
     /// Create from string slices (allocates).
-    pub fn from_str(values: Vec<&str>) -> Self {
+    pub fn from_strs(values: Vec<&str>) -> Self {
         Self {
             inner: Arc::new(StringArray::from(values)),
         }
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_create_str_array() {
-        let arr = RelayArray::from_str(vec!["hello", "world"]);
+        let arr = RelayArray::from_strs(vec!["hello", "world"]);
         assert_eq!(arr.len(), 2);
         let str_arr = arr.as_str().unwrap();
         assert_eq!(str_arr.value(0), "hello");

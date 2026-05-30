@@ -5,10 +5,8 @@
 //!
 //! Reference: https://arrow.apache.org/docs/format/CDataInterface.html
 
-use arrow::array::{make_array, Array, ArrayData, ArrayRef, RecordBatch, StructArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::array::{make_array, Array, ArrayRef, RecordBatch, StructArray};
 use arrow::ffi::{from_ffi, to_ffi, FFI_ArrowArray, FFI_ArrowSchema};
-use std::sync::Arc;
 
 use crate::array::RelayArray;
 use crate::recordbatch::RelayRecordBatch;
@@ -97,6 +95,7 @@ pub fn data_ptr(array: &ArrayRef) -> usize {
 mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int32Array, StringArray};
+    use arrow::datatypes::DataType;
 
     #[test]
     fn test_export_import_roundtrip_i32() {
@@ -118,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_export_import_roundtrip_str() {
-        let original = RelayArray::from_str(vec!["hello", "world"]);
+        let original = RelayArray::from_strs(vec!["hello", "world"]);
         let (array, schema) = export_array(&original).unwrap();
         let imported = import_array(array, schema).unwrap();
         assert_eq!(imported.len(), 2);
@@ -154,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_export_import_recordbatch() {
-        let names = RelayArray::from_str(vec!["alice", "bob"]);
+        let names = RelayArray::from_strs(vec!["alice", "bob"]);
         let ages = RelayArray::from_i32(vec![25, 30]);
         let batch = RelayRecordBatch::new(
             vec!["name".to_string(), "age".to_string()],
