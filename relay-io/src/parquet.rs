@@ -12,7 +12,8 @@
 use std::fs::File;
 use std::path::Path;
 
-use arrow::array::{Array, Float64Array, Int64Array};
+use arrow::array::{Array, BooleanArray, Float64Array, Int64Array};
+use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow_array::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -24,8 +25,16 @@ use relay_core::{RelayError, Result};
 
 use crate::mmap::{compare_i64_scalar, AggOp, AggResult};
 
-/// Default batch size for Parquet reading (good balance of vectorization vs memory).
-const DEFAULT_BATCH_SIZE: usize = 8192;
+/// Convert null buffer to BooleanArray for bitmask AND operations.
+#[inline]
+fn nulls_to_boolean(arr: &dyn Array) -> BooleanArray {
+    BooleanArray::from(
+        arr.nulls()
+            .map(|n| n.clone().into_inner())
+            .unwrap_or_else(|| BooleanBuffer::new_set(arr.len())),
+    )
+}
+
 
 /// A high-performance reader for Apache Parquet files.
 ///
@@ -42,6 +51,8 @@ pub struct ParquetReader {
     /// Schema descriptor for ProjectionMask construction
     schema_descr: parquet::schema::types::SchemaDescPtr,
     file_path: String,
+    /// Max row group size (used as batch size to get 1 batch per row group)
+    max_row_group_size: usize,
 }
 
 impl ParquetReader {
@@ -66,6 +77,7 @@ impl ParquetReader {
             .map(|rg| rg.num_rows() as usize)
             .collect();
         let total_rows: usize = row_group_row_counts.iter().sum();
+        let max_row_group_size = row_group_row_counts.iter().copied().max().unwrap_or(8192);
 
         Ok(Self {
             file,
@@ -75,6 +87,7 @@ impl ParquetReader {
             total_rows,
             schema_descr,
             file_path: path.to_string_lossy().to_string(),
+            max_row_group_size,
         })
     }
 
@@ -122,7 +135,7 @@ impl ParquetReader {
         let builder = self.new_builder()?;
         let reader = builder
             .with_row_groups(vec![index])
-            .with_batch_size(DEFAULT_BATCH_SIZE)
+            .with_batch_size(self.max_row_group_size)
             .build()
             .map_err(|e| RelayError::Arrow(format!("Parquet read error: {}", e)))?;
 
@@ -159,7 +172,7 @@ impl ParquetReader {
         let reader = builder
             .with_row_groups(vec![index])
             .with_projection(mask)
-            .with_batch_size(DEFAULT_BATCH_SIZE)
+            .with_batch_size(self.max_row_group_size)
             .build()
             .map_err(|e| RelayError::Arrow(format!("Parquet projected read: {}", e)))?;
 
@@ -181,39 +194,69 @@ impl ParquetReader {
         }
     }
 
-    /// Read all row groups.
+    /// Read all row groups in parallel via Rayon.
+    /// Each row group gets its own independent File handle for concurrent decoding.
     pub fn read_all(&self) -> Result<Vec<RecordBatch>> {
-        let builder = self.new_builder()?;
-        let reader = builder
-            .with_batch_size(DEFAULT_BATCH_SIZE)
-            .build()
-            .map_err(|e| RelayError::Arrow(format!("Parquet read all: {}", e)))?;
-
-        let mut batches = Vec::with_capacity(self.num_row_groups);
-        for batch in reader {
-            batches
-                .push(batch.map_err(|e| RelayError::Arrow(format!("Parquet read batch: {}", e)))?);
+        if self.num_row_groups == 0 {
+            return Ok(Vec::new());
         }
-        Ok(batches)
+        let results: Result<Vec<RecordBatch>> = (0..self.num_row_groups)
+            .into_par_iter()
+            .map(|rg_idx| {
+                let file = File::open(&self.file_path).map_err(|e| RelayError::Io(e))?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|e| RelayError::Arrow(format!("Parquet builder: {}", e)))?;
+                let reader = builder
+                    .with_row_groups(vec![rg_idx])
+                    .with_batch_size(self.max_row_group_size)
+                    .build()
+                    .map_err(|e| RelayError::Arrow(format!("Parquet read: {}", e)))?;
+                let mut result: Option<RecordBatch> = None;
+                for batch in reader {
+                    let batch = batch.map_err(|e| RelayError::Arrow(format!("Batch: {}", e)))?;
+                    if let Some(ref mut existing) = result {
+                        *existing = concat_two_batches(existing, &batch)?;
+                    } else {
+                        result = Some(batch);
+                    }
+                }
+                result.ok_or_else(|| RelayError::Arrow(format!("Row group {} empty", rg_idx)))
+            })
+            .collect();
+        results
     }
 
-    /// Read all row groups with column projection pushdown.
+    /// Read all row groups with column projection pushdown (parallel).
     pub fn read_all_projected(&self, projection: &[usize]) -> Result<Vec<RecordBatch>> {
-        let mask = ProjectionMask::leaves(&self.schema_descr, projection.to_vec());
-        let builder = self.new_builder()?;
-        let reader = builder
-            .with_projection(mask)
-            .with_batch_size(DEFAULT_BATCH_SIZE)
-            .build()
-            .map_err(|e| RelayError::Arrow(format!("Parquet projected read all: {}", e)))?;
-
-        let mut batches = Vec::new();
-        for batch in reader {
-            batches.push(
-                batch.map_err(|e| RelayError::Arrow(format!("Parquet projected batch: {}", e)))?,
-            );
+        if self.num_row_groups == 0 {
+            return Ok(Vec::new());
         }
-        Ok(batches)
+        let mask = ProjectionMask::leaves(&self.schema_descr, projection.to_vec());
+        let results: Result<Vec<RecordBatch>> = (0..self.num_row_groups)
+            .into_par_iter()
+            .map(|rg_idx| {
+                let file = File::open(&self.file_path).map_err(|e| RelayError::Io(e))?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|e| RelayError::Arrow(format!("Parquet builder: {}", e)))?;
+                let reader = builder
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(mask.clone())
+                    .with_batch_size(self.max_row_group_size)
+                    .build()
+                    .map_err(|e| RelayError::Arrow(format!("Parquet projected read: {}", e)))?;
+                let mut result: Option<RecordBatch> = None;
+                for batch in reader {
+                    let batch = batch.map_err(|e| RelayError::Arrow(format!("Batch: {}", e)))?;
+                    if let Some(ref mut existing) = result {
+                        *existing = concat_two_batches(existing, &batch)?;
+                    } else {
+                        result = Some(batch);
+                    }
+                }
+                result.ok_or_else(|| RelayError::Arrow(format!("Row group {} empty", rg_idx)))
+            })
+            .collect();
+        results
     }
 
     /// Read only specific columns by name (projection pushdown).
@@ -543,63 +586,98 @@ impl ParquetReader {
         }
     }
 
-    /// Parallel filter: reads row groups, filters in parallel with SIMD.
-    /// Uses row group pruning to skip non-matching row groups.
+    /// Parallel filter with late materialization.
+    ///
+    /// Two-pass approach per row group:
+    /// 1. Read ONLY the filter column -> BooleanArray bitmask -> RowSelection
+    /// 2. Read ALL columns with RowSelection (skip 95%% of data!)
+    /// 3. Materialize filtered batches with all columns
     pub fn parallel_filter_i64(
         &self,
         filter_col: &str,
         op: &str,
         threshold: i64,
     ) -> Result<Vec<RecordBatch>> {
-        use arrow::compute;
+        use parquet::arrow::arrow_reader::RowSelection;
 
-        // Row group pruning: skip entire row groups that can't match
+        // Row group pruning
         let matching_rgs = self.row_groups_matching_filter(filter_col, op, threshold)?;
         if matching_rgs.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Read only matching row groups (with all columns for result)
-        let builder = self.new_builder()?;
-        let reader = builder
-            .with_row_groups(matching_rgs)
-            .with_batch_size(DEFAULT_BATCH_SIZE)
-            .build()
-            .map_err(|e| RelayError::Arrow(format!("Parquet filter read: {}", e)))?;
-
-        let col_idx = self
+        let filter_idx = self
             .schema
             .index_of(filter_col)
-            .map_err(|_| RelayError::Expr(format!("Column '{}' not found", filter_col)))?;
+            .map_err(|_| RelayError::Expr(format!("Column {} not found", filter_col)))?;
 
-        let batches: Vec<RecordBatch> = reader.filter_map(|b| b.ok()).collect();
-
-        // Parallel filter per batch
-        let filtered: Vec<RecordBatch> = batches
+        // PASS 1: Read ONLY the filter column per row group (parallel)
+        let filter_mask = ProjectionMask::leaves(&self.schema_descr, vec![filter_idx]);
+        let filter_bitmasks: Vec<(usize, BooleanArray)> = matching_rgs
             .par_iter()
-            .filter_map(|batch| {
-                let col = batch
-                    .column(col_idx)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()?;
-
-                let mask = compare_i64_scalar(col, op, threshold).ok()?;
-
-                // Skip empty results
-                let passing = mask.iter().filter(|v| v == &Some(true)).count();
-                if passing == 0 {
-                    return None;
+            .filter_map(|&rg_idx| {
+                let file = File::open(&self.file_path).ok()?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+                let reader = builder
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(filter_mask.clone())
+                    .with_batch_size(self.max_row_group_size)
+                    .build()
+                    .ok()?;
+                let mut bitmask: Option<BooleanArray> = None;
+                for batch in reader {
+                    let batch = batch.ok()?;
+                    let col = batch.column(0).as_any().downcast_ref::<Int64Array>()?;
+                    let mask = compare_i64_scalar(col, op, threshold).ok()?;
+                    if let Some(ref existing) = bitmask {
+                        bitmask = Some(arrow::compute::and(existing, &mask).ok()?);
+                    } else {
+                        bitmask = Some(mask);
+                    }
                 }
+                bitmask.map(|b| (rg_idx, b))
+            })
+            .collect();
 
-                compute::filter_record_batch(batch, &mask).ok()
+        if filter_bitmasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // PASS 2: Read ALL columns with RowSelection (parallel)
+        let filtered: Vec<RecordBatch> = filter_bitmasks
+            .par_iter()
+            .filter_map(|&(rg_idx, ref bitmask)| {
+                let rg_sel = RowSelection::from_filters(&[bitmask.clone()]);
+                let file = File::open(&self.file_path).ok()?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+                let reader = builder
+                    .with_row_groups(vec![rg_idx])
+                    .with_row_selection(rg_sel)
+                    .with_batch_size(self.max_row_group_size)
+                    .build()
+                    .ok()?;
+                let mut result: Option<RecordBatch> = None;
+                for batch in reader {
+                    let batch = batch.ok()?;
+                    if let Some(ref mut existing) = result {
+                        *existing = concat_two_batches(existing, &batch).ok()?;
+                    } else {
+                        result = Some(batch);
+                    }
+                }
+                result
             })
             .collect();
 
         Ok(filtered)
     }
 
-    /// Fused parallel filter + aggregate with row group pruning.
-    /// The fastest path: skip non-matching row groups, filter + agg in one pass.
+    /// Fused parallel filter + aggregate with late materialization.
+    ///
+    /// Two-pass approach per row group:
+    /// 1. Read ONLY the filter column -> BooleanArray bitmask
+    /// 2. Read ONLY the agg column with RowSelection (skip 90%% of rows)
+    /// 3. Apply arrow compute kernel to pre-filtered data
     pub fn parallel_filter_agg_i64(
         &self,
         filter_col: &str,
@@ -608,6 +686,8 @@ impl ParquetReader {
         agg_col: &str,
         agg_op: AggOp,
     ) -> Result<AggResult> {
+        use parquet::arrow::arrow_reader::RowSelection;
+
         // Row group pruning
         let matching_rgs = self.row_groups_matching_filter(filter_col, op, threshold)?;
         if matching_rgs.is_empty() {
@@ -617,172 +697,174 @@ impl ParquetReader {
         let filter_idx = self
             .schema
             .index_of(filter_col)
-            .map_err(|_| RelayError::Expr(format!("Column '{}' not found", filter_col)))?;
+            .map_err(|_| RelayError::Expr(format!("Column {} not found", filter_col)))?;
         let agg_idx = self
             .schema
             .index_of(agg_col)
-            .map_err(|_| RelayError::Expr(format!("Column '{}' not found", agg_col)))?;
+            .map_err(|_| RelayError::Expr(format!("Column {} not found", agg_col)))?;
 
-        // Project only needed columns
-        let mut projection = vec![filter_idx, agg_idx];
-        projection.sort();
-        projection.dedup();
+        // PASS 1: Read ONLY the filter column across all matching row groups (parallel)
+        let filter_mask = ProjectionMask::leaves(&self.schema_descr, vec![filter_idx]);
+        let filter_bitmasks: Vec<(usize, BooleanArray)> = matching_rgs
+            .par_iter()
+            .filter_map(|&rg_idx| {
+                let file = File::open(&self.file_path).ok()?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+                let reader = builder
+                    .with_row_groups(vec![rg_idx])
+                    .with_projection(filter_mask.clone())
+                    .with_batch_size(self.max_row_group_size)
+                    .build()
+                    .ok()?;
+                let mut bitmask: Option<BooleanArray> = None;
+                for batch in reader {
+                    let batch = batch.ok()?;
+                    let col = batch.column(0).as_any().downcast_ref::<Int64Array>()?;
+                    let mask = compare_i64_scalar(col, op, threshold).ok()?;
+                    if let Some(ref existing) = bitmask {
+                        bitmask = Some(arrow::compute::and(existing, &mask).ok()?);
+                    } else {
+                        bitmask = Some(mask);
+                    }
+                }
+                bitmask.map(|b| (rg_idx, b))
+            })
+            .collect();
 
-        let mask_proj = ProjectionMask::leaves(&self.schema_descr, projection.clone());
-        let builder = self.new_builder()?;
-        let reader = builder
-            .with_row_groups(matching_rgs)
-            .with_projection(mask_proj)
-            .with_batch_size(DEFAULT_BATCH_SIZE)
-            .build()
-            .map_err(|e| RelayError::Arrow(format!("Parquet fused read: {}", e)))?;
-
-        let batches: Vec<RecordBatch> = reader.filter_map(|b| b.ok()).collect();
-        if batches.is_empty() {
+        if filter_bitmasks.is_empty() {
             return Ok(AggResult::Null);
         }
 
-        // Map column names to projection indices
-        let filter_proj_idx = projection.iter().position(|&i| i == filter_idx).unwrap();
-        let agg_proj_idx = projection.iter().position(|&i| i == agg_idx).unwrap();
+        // Detect aggregation type from schema
+        let agg_data_type = self
+            .schema
+            .field(agg_idx)
+            .data_type()
+            .clone();
 
-        // Detect aggregation column type from first batch
-        let agg_data_type = batches[0].column(agg_proj_idx).data_type().clone();
+        // Helper: build RowSelection for a specific row group from bitmasks
+        let build_rg_selection = |rg_idx: usize| -> Option<BooleanArray> {
+            filter_bitmasks
+                .iter()
+                .find(|(idx, _)| *idx == rg_idx)
+                .map(|(_, m)| m.clone())
+        };
 
-        // Parallel: per-batch filter + aggregate (fused, no materialization)
+        // PASS 2: Read ONLY the agg column with RowSelection (parallel, late materialization)
+        let agg_mask = ProjectionMask::leaves(&self.schema_descr, vec![agg_idx]);
+        let agg_rgs: Vec<usize> = filter_bitmasks.iter().map(|&(idx, _)| idx).collect();
+
         match agg_op {
             AggOp::Sum | AggOp::Count | AggOp::Min | AggOp::Max => {
                 match agg_data_type {
                     DataType::Float64 => {
-                        let partials_f64: Vec<f64> = batches
+                        let partials: Vec<f64> = agg_rgs
                             .par_iter()
-                            .map(|batch| {
-                                let filter_col_arr = batch
-                                    .column(filter_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Int64Array>()
-                                    .unwrap();
-                                let agg_arr = batch
-                                    .column(agg_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Float64Array>()
-                                    .unwrap();
-                                let mask = match compare_i64_scalar(filter_col_arr, op, threshold) {
-                                    Ok(m) => m,
-                                    Err(_) => return 0.0,
+                            .filter_map(|&rg_idx| {
+                                let sel_mask = build_rg_selection(rg_idx)?;
+                                let rg_sel = RowSelection::from_filters(&[sel_mask]);
+                                let file = File::open(&self.file_path).ok()?;
+                                let builder =
+                                    ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+                                let reader = builder
+                                    .with_row_groups(vec![rg_idx])
+                                    .with_projection(agg_mask.clone())
+                                    .with_row_selection(rg_sel)
+                                    .with_batch_size(self.max_row_group_size)
+                                    .build()
+                                    .ok()?;
+                                let mut result: f64 = match agg_op {
+                                    AggOp::Min => f64::MAX,
+                                    AggOp::Max => f64::MIN,
+                                    _ => 0.0,
                                 };
-                                match agg_op {
-                                    AggOp::Sum => {
-                                        let mut sum: f64 = 0.0;
-                                        for i in 0..agg_arr.len() {
-                                            if mask.value(i) && !agg_arr.is_null(i) {
-                                                sum += agg_arr.value(i);
+                                for batch in reader {
+                                    let batch = batch.ok()?;
+                                    let col =
+                                        batch.column(0).as_any().downcast_ref::<Float64Array>()?;
+                                    match agg_op {
+                                        AggOp::Sum | AggOp::Mean => {
+                                            result += arrow::compute::sum(col).unwrap_or(0.0);
+                                        }
+                                        AggOp::Count => {
+                                            result += (col.len() - col.null_count()) as f64;
+                                        }
+                                        AggOp::Min => {
+                                            if let Some(v) = arrow::compute::min(col) {
+                                                result = result.min(v);
                                             }
                                         }
-                                        sum
-                                    }
-                                    AggOp::Count => {
-                                        let mut count: f64 = 0.0;
-                                        for i in 0..agg_arr.len() {
-                                            if mask.value(i) && !agg_arr.is_null(i) {
-                                                count += 1.0;
+                                        AggOp::Max => {
+                                            if let Some(v) = arrow::compute::max(col) {
+                                                result = result.max(v);
                                             }
                                         }
-                                        count
+                                        _ => {}
                                     }
-                                    AggOp::Min => {
-                                        let mut min = f64::MAX;
-                                        for i in 0..agg_arr.len() {
-                                            if mask.value(i) && !agg_arr.is_null(i) {
-                                                min = min.min(agg_arr.value(i));
-                                            }
-                                        }
-                                        min
-                                    }
-                                    AggOp::Max => {
-                                        let mut max = f64::MIN;
-                                        for i in 0..agg_arr.len() {
-                                            if mask.value(i) && !agg_arr.is_null(i) {
-                                                max = max.max(agg_arr.value(i));
-                                            }
-                                        }
-                                        max
-                                    }
-                                    _ => unreachable!(),
                                 }
+                                Some(result)
                             })
                             .collect();
                         match agg_op {
                             AggOp::Sum | AggOp::Count => {
-                                Ok(AggResult::Float64(partials_f64.iter().sum()))
+                                Ok(AggResult::Float64(partials.iter().sum()))
                             }
                             AggOp::Min => Ok(AggResult::Float64(
-                                partials_f64.iter().copied().fold(f64::MAX, f64::min),
+                                partials.iter().copied().fold(f64::MAX, f64::min),
                             )),
                             AggOp::Max => Ok(AggResult::Float64(
-                                partials_f64.iter().copied().fold(f64::MIN, f64::max),
+                                partials.iter().copied().fold(f64::MIN, f64::max),
                             )),
                             _ => unreachable!(),
                         }
                     }
                     _ => {
-                        // Default: Int64 aggregation column
-                        let partials: Vec<i64> = batches
+                        // Int64 aggregation column
+                        let partials: Vec<i64> = agg_rgs
                             .par_iter()
-                            .map(|batch| {
-                                let filter_col_arr = batch
-                                    .column(filter_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Int64Array>()
-                                    .unwrap();
-                                let agg_col = batch
-                                    .column(agg_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Int64Array>()
-                                    .unwrap();
-                                let mask = match compare_i64_scalar(filter_col_arr, op, threshold) {
-                                    Ok(m) => m,
-                                    Err(_) => return 0,
+                            .filter_map(|&rg_idx| {
+                                let sel_mask = build_rg_selection(rg_idx)?;
+                                let rg_sel = RowSelection::from_filters(&[sel_mask]);
+                                let file = File::open(&self.file_path).ok()?;
+                                let builder =
+                                    ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+                                let reader = builder
+                                    .with_row_groups(vec![rg_idx])
+                                    .with_projection(agg_mask.clone())
+                                    .with_row_selection(rg_sel)
+                                    .with_batch_size(self.max_row_group_size)
+                                    .build()
+                                    .ok()?;
+                                let mut result: i64 = match agg_op {
+                                    AggOp::Min => i64::MAX,
+                                    AggOp::Max => i64::MIN,
+                                    _ => 0,
                                 };
-                                match agg_op {
-                                    AggOp::Sum => {
-                                        let mut sum: i64 = 0;
-                                        for i in 0..agg_col.len() {
-                                            if mask.value(i) && !agg_col.is_null(i) {
-                                                sum += agg_col.value(i);
+                                for batch in reader {
+                                    let batch = batch.ok()?;
+                                    let col =
+                                        batch.column(0).as_any().downcast_ref::<Int64Array>()?;
+                                    match agg_op {
+                                        AggOp::Sum | AggOp::Mean => {
+                                            result += arrow::compute::sum(col).unwrap_or(0);
+                                        }
+                                        AggOp::Count => {
+                                            result += (col.len() - col.null_count()) as i64;
+                                        }
+                                        AggOp::Min => {
+                                            if let Some(v) = arrow::compute::min(col) {
+                                                result = result.min(v);
                                             }
                                         }
-                                        sum
-                                    }
-                                    AggOp::Count => {
-                                        let mut count: i64 = 0;
-                                        for i in 0..agg_col.len() {
-                                            if mask.value(i) && !agg_col.is_null(i) {
-                                                count += 1;
+                                        AggOp::Max => {
+                                            if let Some(v) = arrow::compute::max(col) {
+                                                result = result.max(v);
                                             }
                                         }
-                                        count
+                                        _ => {}
                                     }
-                                    AggOp::Min => {
-                                        let mut min = i64::MAX;
-                                        for i in 0..agg_col.len() {
-                                            if mask.value(i) && !agg_col.is_null(i) {
-                                                min = min.min(agg_col.value(i));
-                                            }
-                                        }
-                                        min
-                                    }
-                                    AggOp::Max => {
-                                        let mut max = i64::MIN;
-                                        for i in 0..agg_col.len() {
-                                            if mask.value(i) && !agg_col.is_null(i) {
-                                                max = max.max(agg_col.value(i));
-                                            }
-                                        }
-                                        max
-                                    }
-                                    _ => unreachable!(),
                                 }
+                                Some(result)
                             })
                             .collect();
                         match agg_op {
@@ -799,85 +881,55 @@ impl ParquetReader {
                 }
             }
             AggOp::Mean => {
-                // Mean always returns Float64 — handle both Int64 and Float64 agg columns
-                match agg_data_type {
-                    DataType::Float64 => {
-                        let (sum, count) = batches
-                            .par_iter()
-                            .map(|batch| {
-                                let filter_col_arr = batch
-                                    .column(filter_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Int64Array>()
-                                    .unwrap();
-                                let agg_arr = batch
-                                    .column(agg_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Float64Array>()
-                                    .unwrap();
-                                let mask = match compare_i64_scalar(filter_col_arr, op, threshold) {
-                                    Ok(m) => m,
-                                    Err(_) => return (0.0f64, 0i64),
-                                };
-                                let mut sum: f64 = 0.0;
-                                let mut count: i64 = 0;
-                                for i in 0..agg_arr.len() {
-                                    if mask.value(i) && !agg_arr.is_null(i) {
-                                        sum += agg_arr.value(i);
-                                        count += 1;
-                                    }
+                let (sum, count) = agg_rgs
+                    .par_iter()
+                    .filter_map(|&rg_idx| {
+                        let sel_mask = build_rg_selection(rg_idx)?;
+                        let rg_sel = RowSelection::from_filters(&[sel_mask]);
+                        let file = File::open(&self.file_path).ok()?;
+                        let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+                        let reader = builder
+                            .with_row_groups(vec![rg_idx])
+                            .with_projection(agg_mask.clone())
+                            .with_row_selection(rg_sel)
+                            .with_batch_size(self.max_row_group_size)
+                            .build()
+                            .ok()?;
+                        let mut partial_sum = 0.0f64;
+                        let mut partial_count = 0i64;
+                        for batch in reader {
+                            let batch = batch.ok()?;
+                            match agg_data_type {
+                                DataType::Float64 => {
+                                    let col =
+                                        batch.column(0).as_any().downcast_ref::<Float64Array>()?;
+                                    partial_sum += arrow::compute::sum(col).unwrap_or(0.0);
+                                    partial_count += (col.len() - col.null_count()) as i64;
                                 }
-                                (sum, count)
-                            })
-                            .reduce(
-                                || (0.0f64, 0i64),
-                                |(s1, c1), (s2, c2)| (s1 + s2, c1 + c2),
-                            );
-                        if count == 0 {
-                            Ok(AggResult::Null)
-                        } else {
-                            Ok(AggResult::Float64(sum / count as f64))
-                        }
-                    }
-                    _ => {
-                        let (sum, count) = batches
-                            .par_iter()
-                            .map(|batch| {
-                                let filter_col_arr = batch
-                                    .column(filter_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Int64Array>()
-                                    .unwrap();
-                                let agg_col = batch
-                                    .column(agg_proj_idx)
-                                    .as_any()
-                                    .downcast_ref::<Int64Array>()
-                                    .unwrap();
-                                let mask = match compare_i64_scalar(filter_col_arr, op, threshold) {
-                                    Ok(m) => m,
-                                    Err(_) => return (0i64, 0i64),
-                                };
-                                let mut sum: i64 = 0;
-                                let mut count: i64 = 0;
-                                for i in 0..agg_col.len() {
-                                    if mask.value(i) && !agg_col.is_null(i) {
-                                        sum += agg_col.value(i);
-                                        count += 1;
-                                    }
+                                _ => {
+                                    let col =
+                                        batch.column(0).as_any().downcast_ref::<Int64Array>()?;
+                                    partial_sum += arrow::compute::sum(col).unwrap_or(0) as f64;
+                                    partial_count += (col.len() - col.null_count()) as i64;
                                 }
-                                (sum, count)
-                            })
-                            .reduce(|| (0i64, 0i64), |(s1, c1), (s2, c2)| (s1 + s2, c1 + c2));
-                        if count == 0 {
-                            Ok(AggResult::Null)
-                        } else {
-                            Ok(AggResult::Float64(sum as f64 / count as f64))
+                            }
                         }
-                    }
+                        Some((partial_sum, partial_count))
+                    })
+                    .reduce(|| (0.0f64, 0i64), |(s1, c1), (s2, c2)| (s1 + s2, c1 + c2));
+                if count == 0 {
+                    Ok(AggResult::Null)
+                } else {
+                    Ok(AggResult::Float64(sum / count as f64))
                 }
             }
         }
     }
+}
+
+/// Concatenate two RecordBatches into one.
+fn concat_two_batches(a: &RecordBatch, b: &RecordBatch) -> Result<RecordBatch> {
+    concat_batches(&[a.clone(), b.clone()])
 }
 
 /// Concatenate multiple RecordBatches into one.
