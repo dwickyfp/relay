@@ -9,3 +9,7 @@ description = "Expression DSL, type inference, optimization"
 [dependencies]
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-ord = { workspace = true }
+relay-core = { path = "../relay-core" }

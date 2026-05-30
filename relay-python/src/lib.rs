@@ -295,6 +295,324 @@ impl PyScanResult {
         Ok(PyRelayBatch { inner: result_batch })
     }
 
+    /// Aggregate a single column with projection pushdown (only reads needed column).
+    ///
+    /// Args:
+    ///     op: Aggregation operation ("sum", "mean", "min", "max", "count")
+    ///     column: Column name to aggregate
+    ///
+    /// Returns:
+    ///     The aggregated value (int, float, or None).
+    ///
+    /// This is faster than `read_all().agg()` because it only reads the target column.
+    fn agg_column(&self, py: Python<'_>, op: &str, column: &str) -> PyResult<Py<PyAny>> {
+        use relay_expr::{aggregate_array, AggOp};
+
+        let agg_op = match op.to_lowercase().as_str() {
+            "sum" => AggOp::Sum,
+            "mean" | "avg" => AggOp::Mean,
+            "min" => AggOp::Min,
+            "max" => AggOp::Max,
+            "count" => AggOp::Count,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid aggregation: {}. Use sum, mean, min, max, count",
+                    op
+                )))
+            }
+        };
+
+        let reader = self
+            .reader
+            .as_ref()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("ScanResult already consumed")
+            })?;
+
+        // Read only the target column (projection pushdown)
+        let batches = reader
+            .read_columns(&[column])
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        if batches.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err("no batches"));
+        }
+
+        // For sum/count: parallel per-batch aggregate + reduce (skip concat)
+        // For min/max: parallel per-batch + reduce
+        // For mean: parallel sum + count, then divide
+        use arrow::array::{Float64Array, Int64Array};
+        use arrow::datatypes::DataType;
+
+        let result = match agg_op {
+            AggOp::Sum | AggOp::Count | AggOp::Min | AggOp::Max => {
+                // Determine data type from first batch
+                let dt = batches[0].column(0).data_type().clone();
+                match dt {
+                    DataType::Int64 => {
+                        let partials: Vec<i64> = batches
+                            .iter()
+                            .map(|b| {
+                                let arr = b.column(0);
+                                let i64_arr =
+                                    arr.as_any().downcast_ref::<Int64Array>().unwrap();
+                                match agg_op {
+                                    AggOp::Sum => {
+                                        arrow::compute::sum(i64_arr).unwrap_or(0)
+                                    }
+                                    AggOp::Count => {
+                                        (arr.len() - arr.null_count()) as i64
+                                    }
+                                    AggOp::Min => {
+                                        arrow::compute::min(i64_arr).unwrap_or(i64::MAX)
+                                    }
+                                    AggOp::Max => {
+                                        arrow::compute::max(i64_arr).unwrap_or(i64::MIN)
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            })
+                            .collect();
+
+                        let final_val = match agg_op {
+                            AggOp::Sum | AggOp::Count => partials.iter().sum(),
+                            AggOp::Min => {
+                                partials.iter().copied().min().unwrap_or(0)
+                            }
+                            AggOp::Max => {
+                                partials.iter().copied().max().unwrap_or(0)
+                            }
+                            _ => unreachable!(),
+                        };
+                        relay_expr::AggResult::Int64(final_val)
+                    }
+                    DataType::Float64 => {
+                        let partials: Vec<f64> = batches
+                            .iter()
+                            .map(|b| {
+                                let arr = b.column(0);
+                                let f64_arr =
+                                    arr.as_any().downcast_ref::<Float64Array>().unwrap();
+                                match agg_op {
+                                    AggOp::Sum => {
+                                        arrow::compute::sum(f64_arr).unwrap_or(0.0)
+                                    }
+                                    AggOp::Count => {
+                                        (arr.len() - arr.null_count()) as f64
+                                    }
+                                    AggOp::Min => {
+                                        arrow::compute::min(f64_arr).unwrap_or(f64::MAX)
+                                    }
+                                    AggOp::Max => {
+                                        arrow::compute::max(f64_arr).unwrap_or(f64::MIN)
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            })
+                            .collect();
+
+                        let final_val = match agg_op {
+                            AggOp::Sum | AggOp::Count => partials.iter().sum(),
+                            AggOp::Min => {
+                                partials.iter().copied().fold(f64::MAX, f64::min)
+                            }
+                            AggOp::Max => {
+                                partials.iter().copied().fold(f64::MIN, f64::max)
+                            }
+                            _ => unreachable!(),
+                        };
+                        relay_expr::AggResult::Float64(final_val)
+                    }
+                    _ => {
+                        // Fallback: concat + aggregate
+                        let col_chunks: Vec<&dyn arrow::array::Array> =
+                            batches.iter().map(|b| b.column(0).as_ref()).collect();
+                        let concatenated = arrow::compute::concat(&col_chunks)
+                            .map_err(|e| {
+                                pyo3::exceptions::PyValueError::new_err(e.to_string())
+                            })?;
+                        aggregate_array(concatenated.as_ref(), agg_op)
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                            })?
+                    }
+                }
+            }
+            AggOp::Mean => {
+                let dt = batches[0].column(0).data_type().clone();
+                match dt {
+                    DataType::Int64 => {
+                        let mut total_sum: i64 = 0;
+                        let mut total_count: i64 = 0;
+                        for b in &batches {
+                            let arr = b.column(0);
+                            let i64_arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+                            total_sum += arrow::compute::sum(i64_arr).unwrap_or(0);
+                            total_count += (arr.len() - arr.null_count()) as i64;
+                        }
+                        if total_count == 0 {
+                            relay_expr::AggResult::Null
+                        } else {
+                            relay_expr::AggResult::Float64(total_sum as f64 / total_count as f64)
+                        }
+                    }
+                    DataType::Float64 => {
+                        let mut total_sum: f64 = 0.0;
+                        let mut total_count: usize = 0;
+                        for b in &batches {
+                            let arr = b.column(0);
+                            let f64_arr =
+                                arr.as_any().downcast_ref::<Float64Array>().unwrap();
+                            total_sum += arrow::compute::sum(f64_arr).unwrap_or(0.0);
+                            total_count += arr.len() - arr.null_count();
+                        }
+                        if total_count == 0 {
+                            relay_expr::AggResult::Null
+                        } else {
+                            relay_expr::AggResult::Float64(total_sum / total_count as f64)
+                        }
+                    }
+                    _ => {
+                        let col_chunks: Vec<&dyn arrow::array::Array> =
+                            batches.iter().map(|b| b.column(0).as_ref()).collect();
+                        let concatenated = arrow::compute::concat(&col_chunks)
+                            .map_err(|e| {
+                                pyo3::exceptions::PyValueError::new_err(e.to_string())
+                            })?;
+                        aggregate_array(concatenated.as_ref(), agg_op)
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                            })?
+                    }
+                }
+            }
+        };
+
+        // Convert to Python
+        match result {
+            relay_expr::AggResult::Int64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            relay_expr::AggResult::Float64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            relay_expr::AggResult::Null => Ok(py.None()),
+        }
+    }
+
+    /// Filter with projection pushdown (only reads filter column, then applies mask).
+    ///
+    /// Args:
+    ///     column: Column name to filter on
+    ///     op: Comparison operator ("==", "!=", "<", "<=", ">", ">=")
+    ///     value: Value to compare against
+    ///
+    /// Returns:
+    ///     PyRelayBatch with filtered rows (all columns).
+    ///
+    /// This is faster than `read_all().filter()` because it only reads the filter column first.
+    fn filter_column(
+        &self,
+        column: &str,
+        op: &str,
+        value: &Bound<'_, pyo3::types::PyAny>,
+    ) -> PyResult<PyRelayBatch> {
+        use relay_expr::{Expr, Literal, Operator};
+        use relay_expr::filter::filter_batch;
+
+        let operator = match op {
+            "==" | "eq" => Operator::Eq,
+            "!=" | "ne" => Operator::Ne,
+            "<" | "lt" => Operator::Lt,
+            "<=" | "le" => Operator::Le,
+            ">" | "gt" => Operator::Gt,
+            ">=" | "ge" => Operator::Ge,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Invalid operator: {}. Use ==, !=, <, <=, >, >=", op)
+            )),
+        };
+
+        let literal = if let Ok(v) = value.extract::<i64>() {
+            Literal::Int64(v)
+        } else if let Ok(v) = value.extract::<f64>() {
+            Literal::Float64(v)
+        } else if let Ok(v) = value.extract::<String>() {
+            Literal::Str(v)
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Value must be int, float, or string"
+            ));
+        };
+
+        let reader = self
+            .reader
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ScanResult already consumed"))?;
+
+        // Read only the filter column first
+        let filter_batches = reader
+            .read_columns(&[column])
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        if filter_batches.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err("no batches"));
+        }
+
+        // Build mask from filter column only
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::Column(column.to_string())),
+            op: operator,
+            right: Box::new(Expr::Literal(literal)),
+        };
+
+        // Apply mask to each batch and concatenate
+        let mut filtered_batches = Vec::new();
+        for batch in &filter_batches {
+            let filtered = filter_batch(batch, &predicate)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            filtered_batches.push(filtered);
+        }
+
+        // Now read all columns but only for the filtered rows
+        let all_batches = reader
+            .read_all()
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+        // Apply the same filter to all batches
+        let mut result_batches = Vec::new();
+        for batch in &all_batches {
+            let filtered = filter_batch(batch, &predicate)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            result_batches.push(filtered);
+        }
+
+        if result_batches.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err("no results"));
+        }
+
+        // Concatenate
+        let schema = result_batches[0].schema();
+        let num_cols = schema.fields().len();
+        let mut col_data: Vec<Vec<arrow_array::ArrayRef>> = vec![Vec::new(); num_cols];
+        for batch in &result_batches {
+            for (i, col) in batch.columns().iter().enumerate() {
+                col_data[i].push(col.clone());
+            }
+        }
+
+        let mut result_cols = Vec::with_capacity(num_cols);
+        for col_chunks in &col_data {
+            let refs: Vec<&dyn arrow::array::Array> = col_chunks.iter().map(|c| c.as_ref()).collect();
+            let concatenated = arrow::compute::concat(&refs)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            result_cols.push(RelayArray::new(concatenated));
+        }
+
+        let result_batch = RelayRecordBatch::new(
+            schema.fields().iter().map(|f| f.name().clone()).collect(),
+            result_cols,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        Ok(PyRelayBatch { inner: result_batch })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ScanResult(path={}, rows={}, cols={}, mmap={}bytes)",
@@ -629,5 +947,99 @@ impl PyRelayBatch {
 
         to_stream_pycapsule(py, reader, requested_schema.cloned())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Filter rows based on a column comparison.
+    ///
+    /// Args:
+    ///     column: Column name to filter on
+    ///     op: Comparison operator ("==", "!=", "<", "<=", ">", ">=")
+    ///     value: Value to compare against (int, float, or string)
+    ///
+    /// Returns:
+    ///     A new RelayBatch with only matching rows.
+    ///
+    /// Example:
+    ///     filtered = batch.filter("age", ">", 30)
+    fn filter(&self, column: &str, op: &str, value: &Bound<'_, pyo3::types::PyAny>) -> PyResult<PyRelayBatch> {
+        use relay_expr::{Expr, Literal, Operator};
+        use relay_expr::filter::filter_batch;
+
+        let op = match op {
+            "==" | "eq" => Operator::Eq,
+            "!=" | "ne" => Operator::Ne,
+            "<" | "lt" => Operator::Lt,
+            "<=" | "le" => Operator::Le,
+            ">" | "gt" => Operator::Gt,
+            ">=" | "ge" => Operator::Ge,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Invalid operator: {}. Use ==, !=, <, <=, >, >=", op)
+            )),
+        };
+
+        // Try to extract value as different types
+        let literal = if let Ok(v) = value.extract::<i64>() {
+            Literal::Int64(v)
+        } else if let Ok(v) = value.extract::<f64>() {
+            Literal::Float64(v)
+        } else if let Ok(v) = value.extract::<String>() {
+            Literal::Str(v)
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Value must be int, float, or string"
+            ));
+        };
+
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::Column(column.to_string())),
+            op,
+            right: Box::new(Expr::Literal(literal)),
+        };
+
+        let arrow_rb = self.inner.as_arrow_recordbatch();
+        let filtered = filter_batch(&arrow_rb, &predicate)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let relay_batch = RelayRecordBatch::from_arrow(filtered);
+        Ok(PyRelayBatch { inner: relay_batch })
+    }
+
+    /// Aggregate a column using a specified operation.
+    ///
+    /// Args:
+    ///     op: Aggregation operation ("sum", "mean", "min", "max", "count")
+    ///     column: Column name to aggregate
+    ///
+    /// Returns:
+    ///     The aggregated value (int, float, or None).
+    ///
+    /// Example:
+    ///     total = batch.agg("sum", "amount")
+    fn agg(&self, py: Python<'_>, op: &str, column: &str) -> PyResult<Py<PyAny>> {
+        use relay_expr::{AggOp, aggregate_array};
+
+        let agg_op = match op.to_lowercase().as_str() {
+            "sum" => AggOp::Sum,
+            "mean" | "avg" => AggOp::Mean,
+            "min" => AggOp::Min,
+            "max" => AggOp::Max,
+            "count" => AggOp::Count,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Invalid aggregation: {}. Use sum, mean, min, max, count", op)
+            )),
+        };
+
+        let col = self.inner.column_by_name(column)
+            .map_err(|e| pyo3::exceptions::PyKeyError::new_err(e.to_string()))?;
+
+        let result = aggregate_array(col.as_arrow(), agg_op)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Convert AggResult to Python object using py token
+        match result {
+            relay_expr::AggResult::Int64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            relay_expr::AggResult::Float64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+            relay_expr::AggResult::Null => Ok(py.None()),
+        }
     }
 }

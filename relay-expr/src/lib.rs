@@ -1,9 +1,14 @@
-//! Expression DSL, type inference, optimization
+//! Expression DSL, type inference, and vectorized evaluation engine.
+//!
+//! Provides column expressions, comparison operators, and aggregations
+//! that execute directly on Arrow arrays — no Python loops.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert!(true);
-    }
-}
+pub mod agg;
+pub mod expr;
+pub mod filter;
+pub mod plan;
+
+pub use agg::{aggregate_array, AggOp, AggResult};
+pub use expr::{Expr, Literal, Operator};
+pub use filter::{eval_filter, filter_batch};
+pub use plan::QueryPlan;

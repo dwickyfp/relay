@@ -31,6 +31,9 @@ pub enum RelayError {
 
     #[error("Execution error: {0}")]
     Execution(String),
+
+    #[error("Expression error: {0}")]
+    Expr(String),
 }
 
 /// Result type alias using RelayError.
