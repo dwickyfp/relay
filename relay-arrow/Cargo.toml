@@ -11,5 +11,10 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
 memmap2 = { workspace = true }
 relay-core = { path = "../relay-core" }
+
+[features]
+default = []
+ffi = []

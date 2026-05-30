@@ -12,5 +12,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { workspace = true }
+pyo3-arrow = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
 relay-arrow = { path = "../relay-arrow" }
 relay-core = { path = "../relay-core" }
+bytemuck = { version = "1.23", features = ["derive"] }

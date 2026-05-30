@@ -1,7 +1,7 @@
 //! Wrapper around Arrow arrays with Relay-specific functionality.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
 };
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -30,6 +30,13 @@ impl RelayArray {
     pub fn from_i64(values: Vec<i64>) -> Self {
         Self {
             inner: Arc::new(Int64Array::from(values)),
+        }
+    }
+
+    /// Create from a Vec<f32> (allocates).
+    pub fn from_f32(values: Vec<f32>) -> Self {
+        Self {
+            inner: Arc::new(Float32Array::from(values)),
         }
     }
 

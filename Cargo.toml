@@ -21,7 +21,7 @@ description = "Zero-copy data engine for Python, powered by Rust and Apache Arro
 readme = "README.md"
 
 [workspace.dependencies]
-arrow = "58"
+arrow = { version = "58", features = ["ffi"] }
 arrow-array = "58"
 arrow-buffer = "58"
 arrow-schema = "58"
